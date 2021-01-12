@@ -71,22 +71,15 @@ data_node_scan_next(CustomScanState *node)
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 	slot = fdw_scan_iterate(&node->ss, &sss->fsstate);
 	MemoryContextSwitchTo(oldcontext);
-	/*
-	 * If any system columns are requested, we have to force the tuple into
-	 * physical-tuple form to avoid "cannot extract system attribute from
-	 * virtual tuple" errors later.  We also insert a valid value for
-	 * tableoid, which is the only actually-useful system column.
-	 */
-	if (sss->systemcol && !TupIsNull(slot))
-	{
-#if PG12_LT
-		HeapTuple tup = ExecMaterializeSlot(slot);
 
-		tup->t_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
-#else
-		slot->tts_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
-#endif
-	}
+	/* Raise an error when system column is requsted, eg. tableoid */
+	if (sss->systemcol && !TupIsNull(slot))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("system columns are not accessible on distributed hypertables with current "
+						"settings"),
+				 errhint("Set timescaledb.enable_per_data_node_queries=false to query system "
+						 "columns.")));
 
 	return slot;
 }
@@ -155,7 +148,16 @@ static void
 create_fetcher(AsyncScanState *ass)
 {
 	DataNodeScanState *dnss = (DataNodeScanState *) ass;
-	create_data_fetcher(&dnss->async_state.css.ss, &dnss->fsstate, FETCH_ASYNC);
+	create_data_fetcher(&dnss->async_state.css.ss, &dnss->fsstate);
+}
+
+static void
+send_fetch_request(AsyncScanState *ass)
+{
+	DataNodeScanState *dnss = (DataNodeScanState *) ass;
+	DataFetcher *fetcher = dnss->fsstate.fetcher;
+
+	fetcher->funcs->send_fetch_request(fetcher);
 }
 
 static void
@@ -163,7 +165,8 @@ fetch_data(AsyncScanState *ass)
 {
 	DataNodeScanState *dnss = (DataNodeScanState *) ass;
 	DataFetcher *fetcher = dnss->fsstate.fetcher;
-	fetcher->funcs->fetch_data_start(fetcher);
+
+	fetcher->funcs->fetch_data(fetcher);
 }
 
 Node *
@@ -175,6 +178,7 @@ data_node_scan_state_create(CustomScan *cscan)
 	dnss->async_state.css.methods = &data_node_scan_state_methods;
 	dnss->systemcol = linitial_int(list_nth(cscan->custom_private, 1));
 	dnss->async_state.init = create_fetcher;
-	dnss->async_state.fetch_tuples = fetch_data;
+	dnss->async_state.send_fetch_request = send_fetch_request;
+	dnss->async_state.fetch_data = fetch_data;
 	return (Node *) dnss;
 }

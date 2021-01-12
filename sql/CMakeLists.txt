@@ -9,6 +9,8 @@ set(PRE_INSTALL_SOURCE_FILES
   pre_install/tables.sql
   pre_install/insert_data.sql
   pre_install/bgw_scheduler_startup.sql
+  pre_install/fdw_functions.sql
+  pre_install/timescaledb_fdw.sql
 )
 
 # Things like aggregate functions cannot be REPLACEd and really
@@ -22,10 +24,10 @@ set(IMMUTABLE_API_SOURCE_FILES
 # The rest of the source files defining mostly functions
 set(SOURCE_FILES
   pre_install/types.functions.sql
+  pre_install/fdw_functions.sql
   hypertable.sql
   chunk.sql
   ddl_internal.sql
-  edition.sql
   util_time.sql
   util_internal_table_ddl.sql
   chunk_constraint.sql
@@ -49,8 +51,9 @@ set(SOURCE_FILES
   maintenance_utils.sql
   partialize_finalize.sql
   restoring.sql
-  timescaledb_fdw.sql
-  remote_txn.sql
+  job_api.sql
+  policy_api.sql
+  policy_internal.sql
 )
 
 # These files should be pre-pended to update scripts so that they are
@@ -94,6 +97,12 @@ set(MOD_FILES
   updates/1.7.0--1.7.1.sql
   updates/1.7.1--1.7.2.sql
   updates/1.7.2--1.7.3.sql
+  updates/1.7.3--1.7.4.sql
+  updates/1.7.4--2.0.0-rc1.sql
+  updates/2.0.0-rc1--2.0.0-rc2.sql
+  updates/2.0.0-rc2--2.0.0-rc3.sql
+  updates/2.0.0-rc3--2.0.0-rc4.sql
+  updates/2.0.0-rc4--2.0.0.sql
 )
 
 set(MODULE_PATHNAME "$libdir/timescaledb-${PROJECT_VERSION_MOD}")

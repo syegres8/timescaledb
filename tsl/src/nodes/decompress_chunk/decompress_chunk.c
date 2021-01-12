@@ -6,6 +6,7 @@
 
 #include <postgres.h>
 #include <catalog/pg_operator.h>
+#include <miscadmin.h>
 #include <nodes/bitmapset.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
@@ -16,7 +17,6 @@
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
 #include <utils/typcache.h>
-#include <miscadmin.h>
 
 #include "compat.h"
 #if PG12_LT
@@ -182,7 +182,7 @@ build_compressed_scan_pathkeys(SortInfo *sort_info, PlannerInfo *root, List *chu
 
 		for (lc = list_head(chunk_pathkeys);
 			 lc != NULL && bms_num_members(segmentby_columns) < info->num_segmentby_columns;
-			 lc = lnext(lc))
+			 lc = lnext_compat(chunk_pathkeys, lc))
 		{
 			PathKey *pk = lfirst(lc);
 			var = (Var *) ts_find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
@@ -739,11 +739,15 @@ create_var_for_compressed_equivalence_member(Var *var, const EMCreationContext *
 	if (var->varlevelsup == 0)
 	{
 		var->varno = context->compressed_relid_idx;
-		var->varnoold = context->compressed_relid_idx;
 		var->varattno =
 			get_attnum(context->compressed_relid, NameStr(context->current_col_info->attname));
-
+#if PG13_GE
+		var->varnosyn = var->varno;
+		var->varattnosyn = var->varattno;
+#else
+		var->varnoold = var->varno;
 		var->varoattno = var->varattno;
+#endif
 
 		return (Node *) var;
 	}
@@ -946,11 +950,13 @@ decompress_chunk_path_create(PlannerInfo *root, CompressionInfo *info, int paral
 	path->cpath.flags = 0;
 	path->cpath.methods = &decompress_chunk_path_methods;
 
-	Assert(parallel_workers == 0 || compressed_path->parallel_safe);
-
-	path->cpath.path.parallel_aware = false;
-	path->cpath.path.parallel_safe = compressed_path->parallel_safe;
+	/* To prevent a non-parallel path with this node appearing
+	 * in a parallel plan we only set parallel_safe to true
+	 * when parallel_workers is greater than 0 which is only
+	 * the case when creating partial paths. */
+	path->cpath.path.parallel_safe = parallel_workers > 0;
 	path->cpath.path.parallel_workers = parallel_workers;
+	path->cpath.path.parallel_aware = false;
 
 	path->cpath.custom_paths = list_make1(compressed_path);
 	path->reverse = false;
@@ -969,6 +975,12 @@ create_compressed_scan_paths(PlannerInfo *root, RelOptInfo *compressed_rel, int 
 							 CompressionInfo *info, SortInfo *sort_info)
 {
 	Path *compressed_path;
+
+	/* clamp total_table_pages to 10 pages since this is the
+	 * minimum estimate for number of pages.
+	 * Add the value to any existing estimates
+	 */
+	root->total_table_pages += Max(compressed_rel->pages, 10);
 
 	/* create non parallel scan path */
 	compressed_path = create_seqscan_path(root, compressed_rel, NULL, 0);
@@ -1202,7 +1214,7 @@ build_sortinfo(RelOptInfo *chunk_rel, CompressionInfo *info, List *pathkeys)
 		 * we keep looping even if we found all segmentby columns in case a
 		 * columns appears both in baserestrictinfo and in ORDER BY clause
 		 */
-		for (; lc != NULL; lc = lnext(lc))
+		for (; lc != NULL; lc = lnext_compat(pathkeys, lc))
 		{
 			Assert(bms_num_members(segmentby_columns) <= info->num_segmentby_columns);
 			pk = lfirst(lc);
@@ -1242,7 +1254,7 @@ build_sortinfo(RelOptInfo *chunk_rel, CompressionInfo *info, List *pathkeys)
 	 * loop over the rest of pathkeys
 	 * this needs to exactly match the configured compress_orderby
 	 */
-	for (pk_index = 1; lc != NULL; lc = lnext(lc), pk_index++)
+	for (pk_index = 1; lc != NULL; lc = lnext_compat(pathkeys, lc), pk_index++)
 	{
 		bool reverse = false;
 		pk = lfirst(lc);

@@ -21,7 +21,6 @@
 #include "dimension.h"
 #include "errors.h"
 #include "hypertable.h"
-#include "license.h"
 #include "utils.h"
 #include "hypertable_cache.h"
 #include "chunk.h"
@@ -163,9 +162,9 @@ hypertable_get_and_validate_data_nodes(ArrayType *nodearr)
 
 	if (num_data_nodes == 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_TS_NO_DATA_NODES),
+				(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
 				 errmsg("no data nodes can be assigned to the hypertable"),
-				 errhint("Add data nodes using the add_data_node() function.")));
+				 errhint("Add data nodes to the database.")));
 
 	if (num_data_nodes == 1)
 		ereport(WARNING,
@@ -223,8 +222,8 @@ update_replication_factor(Hypertable *const ht, const int32 replication_factor_i
 	ts_hypertable_update(ht);
 	if (list_length(ht->data_nodes) < replication_factor)
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("too big replication factor for hypertable \"%s\"",
+				(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
+				 errmsg("replication factor too large for hypertable \"%s\"",
 						NameStr(ht->fd.table_name)),
 				 errdetail("The hypertable has %d data nodes attached, while "
 						   "the replication factor is %d.",
@@ -247,7 +246,7 @@ hypertable_set_replication_factor(PG_FUNCTION_ARGS)
 	Cache *hcache;
 	Hypertable *ht;
 
-	PreventCommandIfReadOnly("set_replication_factor()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	if (!OidIsValid(table_relid))
 		ereport(ERROR,

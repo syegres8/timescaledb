@@ -7,6 +7,7 @@ set(TEST_TEMPLATES_MODULE
 set(TEST_TEMPLATES_MODULE_DEBUG
   reorder_vs_insert.spec.in
   reorder_vs_select.spec.in
+  remote_create_chunk.spec.in
 )
 
 list(APPEND TEST_FILES
@@ -14,6 +15,7 @@ list(APPEND TEST_FILES
   continuous_aggs_insert.spec
   continuous_aggs_multi.spec
   continuous_aggs_concurrent_refresh.spec
+  deadlock_drop_chunks_compress.spec
 )
 
 if (CMAKE_BUILD_TYPE MATCHES Debug)

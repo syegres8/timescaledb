@@ -17,8 +17,12 @@
 #include <commands/trigger.h>
 #include <fmgr.h>
 #include <storage/lmgr.h>
+#include <utils/acl.h>
 #include <utils/builtins.h>
+#include <utils/date.h>
 #include <utils/lsyscache.h>
+#include <utils/timestamp.h>
+#include <miscadmin.h>
 
 #include "compat.h"
 
@@ -26,6 +30,8 @@
 #include "continuous_agg.h"
 #include "hypertable.h"
 #include "scan_iterator.h"
+#include "time_bucket.h"
+#include "time_utils.h"
 #include "catalog.h"
 
 #define CHECK_NAME_MATCH(name1, name2) (namestrcmp(name1, name2) == 0)
@@ -36,22 +42,10 @@ static const WithClauseDefinition continuous_aggregate_with_clause_def[] = {
 			.type_id = BOOLOID,
 			.default_val = BoolGetDatum(false),
 		},
-		[ContinuousViewOptionRefreshLag] = {
-			 .arg_name = "refresh_lag",
-			 .type_id = TEXTOID,
-		},
-		[ContinuousViewOptionMaxIntervalPerRun] = {
-			.arg_name = "max_interval_per_job",
-			.type_id = TEXTOID,
-		},
 		[ContinuousViewOptionCreateGroupIndex] = {
 			.arg_name = "create_group_indexes",
 			.type_id = BOOLOID,
 			.default_val = BoolGetDatum(true),
-		},
-		[ContinuousViewOptionIgnoreInvalidationOlderThan] = {
-			.arg_name = "ignore_invalidation_older_than",
-			.type_id = TEXTOID,
 		},
 		[ContinuousViewOptionMaterializedOnly] = {
 			.arg_name = "materialized_only",
@@ -90,20 +84,6 @@ init_scan_by_raw_hypertable_id(ScanIterator *iterator, const int32 raw_hypertabl
 								   BTEqualStrategyNumber,
 								   F_INT4EQ,
 								   Int32GetDatum(raw_hypertable_id));
-}
-
-static void
-init_completed_threshold_scan_by_mat_id(ScanIterator *iterator, const int32 mat_hypertable_id)
-{
-	iterator->ctx.index = catalog_get_index(ts_catalog_get(),
-											CONTINUOUS_AGGS_COMPLETED_THRESHOLD,
-											CONTINUOUS_AGGS_COMPLETED_THRESHOLD_PKEY);
-
-	ts_scan_iterator_scan_key_init(iterator,
-								   Anum_continuous_aggs_completed_threshold_pkey_materialization_id,
-								   BTEqualStrategyNumber,
-								   F_INT4EQ,
-								   Int32GetDatum(mat_hypertable_id));
 }
 
 static void
@@ -165,48 +145,6 @@ number_of_continuous_aggs_attached(int32 raw_hypertable_id)
 	return count;
 }
 
-TSDLLEXPORT
-int64
-ts_continuous_agg_get_completed_threshold(int32 materialization_id)
-{
-	ScanIterator iterator = ts_scan_iterator_create(CONTINUOUS_AGGS_COMPLETED_THRESHOLD,
-													AccessShareLock,
-													CurrentMemoryContext);
-	int64 threshold = PG_INT64_MIN;
-	int count = 0;
-
-	init_completed_threshold_scan_by_mat_id(&iterator, materialization_id);
-	ts_scanner_foreach(&iterator)
-	{
-		bool isnull;
-		Datum datum = slot_getattr(ts_scan_iterator_slot(&iterator),
-								   Anum_continuous_aggs_completed_threshold_watermark,
-								   &isnull);
-
-		Assert(!isnull);
-		threshold = DatumGetInt64(datum);
-		count++;
-	}
-	Assert(count <= 1);
-	return threshold;
-}
-
-static void
-completed_threshold_delete(int32 materialization_id)
-{
-	ScanIterator iterator = ts_scan_iterator_create(CONTINUOUS_AGGS_COMPLETED_THRESHOLD,
-													RowExclusiveLock,
-													CurrentMemoryContext);
-
-	init_completed_threshold_scan_by_mat_id(&iterator, materialization_id);
-
-	ts_scanner_foreach(&iterator)
-	{
-		TupleInfo *ti = ts_scan_iterator_tuple_info(&iterator);
-		ts_catalog_delete_tid(ti->scanrel, ts_scanner_get_tuple_tid(ti));
-	}
-}
-
 static void
 invalidation_threshold_delete(int32 raw_hypertable_id)
 {
@@ -257,8 +195,11 @@ materialization_invalidation_log_delete(int32 materialization_id)
 }
 
 static void
-continuous_agg_init(ContinuousAgg *cagg, FormData_continuous_agg *fd)
+continuous_agg_init(ContinuousAgg *cagg, const Form_continuous_agg fd)
 {
+	Oid nspid = get_namespace_oid(NameStr(fd->user_view_schema), false);
+
+	cagg->relid = get_relname_relid(NameStr(fd->user_view_name), nspid);
 	memcpy(&cagg->data, fd, sizeof(cagg->data));
 }
 
@@ -322,84 +263,6 @@ ts_continuous_aggs_find_by_raw_table_id(int32 raw_hypertable_id)
 	return continuous_aggs;
 }
 
-TSDLLEXPORT int64
-ts_continuous_aggs_max_ignore_invalidation_older_than(int32 raw_hypertable_id,
-													  FormData_continuous_agg *entry)
-{
-	ScanIterator iterator =
-		ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
-	int64 ignore_invalidation_older_than = -1;
-
-	init_scan_by_raw_hypertable_id(&iterator, raw_hypertable_id);
-	ts_scanner_foreach(&iterator)
-	{
-		bool should_free;
-		HeapTuple tuple = ts_scan_iterator_fetch_heap_tuple(&iterator, false, &should_free);
-
-		FormData_continuous_agg *data = (FormData_continuous_agg *) GETSTRUCT(tuple);
-
-		if (ignore_invalidation_older_than < data->ignore_invalidation_older_than)
-			ignore_invalidation_older_than = data->ignore_invalidation_older_than;
-		if (entry != NULL)
-			memcpy(entry, data, sizeof(*entry));
-
-		if (should_free)
-			heap_freetuple(tuple);
-	}
-
-	return ignore_invalidation_older_than;
-}
-
-TSDLLEXPORT int64
-ts_continuous_aggs_min_completed_threshold(int32 raw_hypertable_id, FormData_continuous_agg *entry)
-{
-	ScanIterator iterator =
-		ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
-	int64 min_threshold = PG_INT64_MAX;
-
-	init_scan_by_raw_hypertable_id(&iterator, raw_hypertable_id);
-	ts_scanner_foreach(&iterator)
-	{
-		bool should_free;
-		HeapTuple tuple = ts_scan_iterator_fetch_heap_tuple(&iterator, false, &should_free);
-		FormData_continuous_agg *data = (FormData_continuous_agg *) GETSTRUCT(tuple);
-		int64 completed_threshold =
-			ts_continuous_agg_get_completed_threshold(data->mat_hypertable_id);
-
-		if (min_threshold > completed_threshold)
-			min_threshold = completed_threshold;
-		if (entry != NULL)
-			memcpy(entry, data, sizeof(*entry));
-
-		if (should_free)
-			heap_freetuple(tuple);
-	}
-
-	return min_threshold;
-}
-
-/* returns the inclusive value for the minimum time to invalidate */
-TSDLLEXPORT int64
-ts_continuous_aggs_get_minimum_invalidation_time(int64 modification_time,
-												 int64 ignore_invalidation_older_than)
-{
-	if (ignore_invalidation_older_than == PG_INT64_MAX ||
-		ignore_invalidation_older_than > modification_time)
-	{
-		/* invalidate everything */
-		return PG_INT64_MIN;
-	}
-	else if (ignore_invalidation_older_than == 0)
-	{
-		/* don't invalidate anything */
-		return PG_INT64_MAX;
-	}
-	else
-	{
-		return modification_time - ignore_invalidation_older_than;
-	}
-}
-
 /* Find a continuous aggregate by the materialized hypertable id */
 ContinuousAgg *
 ts_continuous_agg_find_by_mat_hypertable_id(int32 mat_hypertable_id)
@@ -431,21 +294,63 @@ ts_continuous_agg_find_by_mat_hypertable_id(int32 mat_hypertable_id)
 }
 
 ContinuousAgg *
-ts_continuous_agg_find_by_view_name(const char *schema, const char *name)
+ts_continuous_agg_find_by_view_name(const char *schema, const char *name,
+									ContinuousAggViewType type)
 {
-	ScanIterator iterator =
-		ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
+	ScanIterator iterator;
 	ContinuousAgg *ca = NULL;
+	AttrNumber view_name_attrnum = 0;
+	AttrNumber schema_name_attrnum = 0;
 	int count = 0;
+
+	Assert(schema);
+	Assert(name);
+
+	switch (type)
+	{
+		case ContinuousAggUserView:
+			schema_name_attrnum = Anum_continuous_agg_user_view_schema;
+			view_name_attrnum = Anum_continuous_agg_user_view_name;
+			break;
+		case ContinuousAggPartialView:
+			schema_name_attrnum = Anum_continuous_agg_partial_view_schema;
+			view_name_attrnum = Anum_continuous_agg_partial_view_name;
+			break;
+		case ContinuousAggDirectView:
+			schema_name_attrnum = Anum_continuous_agg_direct_view_schema;
+			view_name_attrnum = Anum_continuous_agg_direct_view_name;
+			break;
+		case ContinuousAggAnyView:
+			break;
+	}
+
+	iterator = ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
+
+	if (type != ContinuousAggAnyView)
+	{
+		ts_scan_iterator_scan_key_init(&iterator,
+									   schema_name_attrnum,
+									   BTEqualStrategyNumber,
+									   F_NAMEEQ,
+									   CStringGetDatum(schema));
+		ts_scan_iterator_scan_key_init(&iterator,
+									   view_name_attrnum,
+									   BTEqualStrategyNumber,
+									   F_NAMEEQ,
+									   CStringGetDatum(name));
+	}
 
 	ts_scanner_foreach(&iterator)
 	{
 		bool should_free;
 		HeapTuple tuple = ts_scan_iterator_fetch_heap_tuple(&iterator, false, &should_free);
 		FormData_continuous_agg *data = (FormData_continuous_agg *) GETSTRUCT(tuple);
-		ContinuousAggViewType vtyp = ts_continuous_agg_view_type(data, schema, name);
+		ContinuousAggViewType vtype = type;
 
-		if (vtyp != ContinuousAggNone)
+		if (vtype == ContinuousAggAnyView)
+			vtype = ts_continuous_agg_view_type(data, schema, name);
+
+		if (vtype != ContinuousAggAnyView)
 		{
 			ca = ts_scan_iterator_alloc_result(&iterator, sizeof(*ca));
 			continuous_agg_init(ca, data);
@@ -455,48 +360,16 @@ ts_continuous_agg_find_by_view_name(const char *schema, const char *name)
 		if (should_free)
 			heap_freetuple(tuple);
 	}
+
 	Assert(count <= 1);
+
 	return ca;
 }
 
 ContinuousAgg *
 ts_continuous_agg_find_userview_name(const char *schema, const char *name)
 {
-	ScanIterator iterator =
-		ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
-	ContinuousAgg *ca = NULL;
-	int count = 0;
-	const char *chkschema = schema;
-
-	ts_scanner_foreach(&iterator)
-	{
-		ContinuousAggViewType vtyp;
-		bool should_free;
-		HeapTuple tuple = ts_scan_iterator_fetch_heap_tuple(&iterator, false, &should_free);
-		FormData_continuous_agg *data = (FormData_continuous_agg *) GETSTRUCT(tuple);
-
-		if (schema == NULL)
-		{
-			/* only user visible views will be returned */
-			Oid relid = RelnameGetRelid(NameStr(data->user_view_name));
-			if (relid == InvalidOid)
-				continue;
-			chkschema = NameStr(data->user_view_schema);
-		}
-
-		vtyp = ts_continuous_agg_view_type(data, chkschema, name);
-		if (vtyp == ContinuousAggUserView)
-		{
-			ca = ts_scan_iterator_alloc_result(&iterator, sizeof(*ca));
-			continuous_agg_init(ca, data);
-			count++;
-		}
-
-		if (should_free)
-			heap_freetuple(tuple);
-	}
-	Assert(count <= 1);
-	return ca;
+	return ts_continuous_agg_find_by_view_name(schema, name, ContinuousAggUserView);
 }
 
 /*
@@ -510,6 +383,9 @@ ts_continuous_agg_find_by_relid(Oid relid)
 {
 	const char *relname = get_rel_name(relid);
 	const char *schemaname = get_namespace_name(get_rel_namespace(relid));
+
+	if (NULL == relname || NULL == schemaname)
+		return NULL;
 
 	return ts_continuous_agg_find_userview_name(schemaname, relname);
 }
@@ -529,37 +405,71 @@ ts_continuous_agg_find_by_rv(const RangeVar *rv)
 	return ts_continuous_agg_find_by_relid(relid);
 }
 
+static ObjectAddress
+get_and_lock_rel_by_name(const Name schema, const Name name, LOCKMODE mode)
+{
+	ObjectAddress addr;
+	Oid relid = InvalidOid;
+	Oid nspid = get_namespace_oid(NameStr(*schema), true);
+	if (OidIsValid(nspid))
+	{
+		relid = get_relname_relid(NameStr(*name), nspid);
+		if (OidIsValid(relid))
+			LockRelationOid(relid, mode);
+	}
+	ObjectAddressSet(addr, RelationRelationId, relid);
+	return addr;
+}
+
+static ObjectAddress
+get_and_lock_rel_by_hypertable_id(int32 hypertable_id, LOCKMODE mode)
+{
+	ObjectAddress addr;
+	Oid relid = ts_hypertable_id_to_relid(hypertable_id);
+	if (OidIsValid(relid))
+		LockRelationOid(relid, mode);
+	ObjectAddressSet(addr, RelationRelationId, relid);
+	return addr;
+}
+
 /*
  * Drops continuous aggs and all related objects.
  *
- * These objects are: the user view itself, the catalog entry in
- * continuous-agg , the partial view,
- * the materialization hypertable,
- * trigger on the raw hypertable (hypertable specified in the user view )
- * copy of the user view query (aka the direct view)
- * NOTE: The order in which the objects are dropped should be EXACTLY the same as in materialize.c"
+ * This function is intended to be run by event trigger during CASCADE,
+ * which implies that most of the dependent objects potentially could be
+ * dropped including associated schema.
+ *
+ * These objects are:
+ *
+ * - user view itself
+ * - continuous agg catalog entry
+ * - partial view
+ * - materialization hypertable
+ * - trigger on the raw hypertable (hypertable specified in the user view)
+ * - copy of the user view query (AKA the direct view)
+ *
+ * NOTE: The order in which the objects are dropped should be EXACTLY the
+ * same as in materialize.c
  *
  * drop_user_view indicates whether to drop the user view.
  *                (should be false if called as part of the drop-user-view callback)
  */
 static void
-drop_continuous_agg(ContinuousAgg *agg, bool drop_user_view)
+drop_continuous_agg(FormData_continuous_agg *cadata, bool drop_user_view)
 {
-	ScanIterator iterator =
-		ts_scan_iterator_create(CONTINUOUS_AGG, RowExclusiveLock, CurrentMemoryContext);
-	Catalog *catalog = ts_catalog_get();
-	ObjectAddress user_view = { .objectId = InvalidOid }, partial_view = { .objectId = InvalidOid },
-				  rawht_trig = { .objectId = InvalidOid }, direct_view = { .objectId = InvalidOid };
-	Hypertable *mat_hypertable, *raw_hypertable;
-	int32 count = 0;
-	bool raw_hypertable_has_other_caggs = true;
-	bool raw_hypertable_exists;
+	Catalog *catalog;
+	ScanIterator iterator;
+	ObjectAddress user_view = { 0 };
+	ObjectAddress partial_view = { 0 };
+	ObjectAddress direct_view = { 0 };
+	ObjectAddress raw_hypertable_trig = { 0 };
+	ObjectAddress raw_hypertable = { 0 };
+	ObjectAddress mat_hypertable = { 0 };
+	bool raw_hypertable_has_other_caggs;
 
-	/* NOTE: the lock order matters, see tsl/src/materialization.c. Perform all locking upfront */
-
-	/* delete the job before taking locks as it kills long-running jobs which we would otherwise
-	 * wait on */
-	List *jobs = ts_bgw_job_find_by_hypertable_id(agg->data.mat_hypertable_id);
+	/* Delete the job before taking locks as it kills long-running jobs
+	 * which we would otherwise wait on */
+	List *jobs = ts_bgw_job_find_by_hypertable_id(cadata->mat_hypertable_id);
 	ListCell *lc;
 
 	foreach (lc, jobs)
@@ -568,82 +478,74 @@ drop_continuous_agg(ContinuousAgg *agg, bool drop_user_view)
 		ts_bgw_job_delete_by_id(job->fd.id);
 	}
 
-	user_view = (ObjectAddress){
-		.classId = RelationRelationId,
-		.objectId =
-			get_relname_relid(NameStr(agg->data.user_view_name),
-							  get_namespace_oid(NameStr(agg->data.user_view_schema), false)),
-	};
-	/* The partial view may already be dropped by PG's dependency system (e.g. the raw table was
-	 * dropped) */
-	if (OidIsValid(user_view.objectId))
-		LockRelationOid(user_view.objectId, AccessExclusiveLock);
+	/*
+	 * Lock objects.
+	 *
+	 * Following objects might be already dropped in case of CASCADE
+	 * drop including the associated schema object.
+	 *
+	 * NOTE: the lock order matters, see tsl/src/materialization.c.
+	 * Perform all locking upfront.
+	 *
+	 * AccessExclusiveLock is needed to drop triggers and also prevent
+	 * concurrent DML commands.
+	 */
+	if (drop_user_view)
+		user_view = get_and_lock_rel_by_name(&cadata->user_view_schema,
+											 &cadata->user_view_name,
+											 AccessExclusiveLock);
+	raw_hypertable =
+		get_and_lock_rel_by_hypertable_id(cadata->raw_hypertable_id, AccessExclusiveLock);
+	mat_hypertable =
+		get_and_lock_rel_by_hypertable_id(cadata->mat_hypertable_id, AccessExclusiveLock);
 
-	raw_hypertable = ts_hypertable_get_by_id(agg->data.raw_hypertable_id);
-	/* The raw hypertable might be already dropped if this is a cascade from that drop */
-	raw_hypertable_exists =
-		(raw_hypertable != NULL && OidIsValid(raw_hypertable->main_table_relid));
-	if (raw_hypertable_exists)
-		/* AccessExclusiveLock is needed to drop triggers.
-		 * Also prevent concurrent DML commands */
-		LockRelationOid(raw_hypertable->main_table_relid, AccessExclusiveLock);
-	mat_hypertable = ts_hypertable_get_by_id(agg->data.mat_hypertable_id);
-	/* AccessExclusiveLock is needed to drop this table. */
-	LockRelationOid(mat_hypertable->main_table_relid, AccessExclusiveLock);
-
-	/* lock catalogs */
+	/* Lock catalogs */
+	catalog = ts_catalog_get();
 	LockRelationOid(catalog_get_table_id(catalog, BGW_JOB), RowExclusiveLock);
 	LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGG), RowExclusiveLock);
+
 	raw_hypertable_has_other_caggs =
-		raw_hypertable_exists && number_of_continuous_aggs_attached(raw_hypertable->fd.id) > 1;
+		OidIsValid(raw_hypertable.objectId) &&
+		number_of_continuous_aggs_attached(cadata->raw_hypertable_id) > 1;
+
 	if (!raw_hypertable_has_other_caggs)
+	{
 		LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGGS_HYPERTABLE_INVALIDATION_LOG),
 						RowExclusiveLock);
-	LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGGS_COMPLETED_THRESHOLD),
-					RowExclusiveLock);
-	if (!raw_hypertable_has_other_caggs)
 		LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGGS_INVALIDATION_THRESHOLD),
 						RowExclusiveLock);
 
-	/* The trigger will be dropped if the hypertable still exists and no other caggs attached */
-	if (!raw_hypertable_has_other_caggs && raw_hypertable_exists)
-	{
-		Oid rawht_trigoid =
-			get_trigger_oid(raw_hypertable->main_table_relid, CAGGINVAL_TRIGGER_NAME, false);
-		rawht_trig = (ObjectAddress){ .classId = TriggerRelationId,
-									  .objectId = rawht_trigoid,
-									  .objectSubId = 0 };
-		/* raw hypertable is locked above */
-		LockRelationOid(rawht_trigoid, AccessExclusiveLock);
+		/* The trigger will be dropped if the hypertable still exists and no other
+		 * caggs attached. */
+		if (OidIsValid(raw_hypertable.objectId))
+		{
+			ObjectAddressSet(raw_hypertable_trig,
+							 TriggerRelationId,
+							 get_trigger_oid(raw_hypertable.objectId,
+											 CAGGINVAL_TRIGGER_NAME,
+											 false));
+
+			/* Raw hypertable is locked above */
+			LockRelationOid(raw_hypertable_trig.objectId, AccessExclusiveLock);
+		}
 	}
 
-	partial_view = (ObjectAddress){
-		.classId = RelationRelationId,
-		.objectId =
-			get_relname_relid(NameStr(agg->data.partial_view_name),
-							  get_namespace_oid(NameStr(agg->data.partial_view_schema), false)),
-	};
-	/* The partial view may already be dropped by PG's dependency system (e.g. the raw table was
-	 * dropped) */
-	if (OidIsValid(partial_view.objectId))
-		LockRelationOid(partial_view.objectId, AccessExclusiveLock);
+	/*
+	 * Following objects might be already dropped in case of CASCADE
+	 * drop including the associated schema object.
+	 */
+	partial_view = get_and_lock_rel_by_name(&cadata->partial_view_schema,
+											&cadata->partial_view_name,
+											AccessExclusiveLock);
 
-	direct_view = (ObjectAddress){
-		.classId = RelationRelationId,
-		.objectId =
-			get_relname_relid(NameStr(agg->data.direct_view_name),
-							  get_namespace_oid(NameStr(agg->data.direct_view_schema), false)),
-	};
-	if (OidIsValid(direct_view.objectId))
-		LockRelationOid(direct_view.objectId, AccessExclusiveLock);
+	direct_view = get_and_lock_rel_by_name(&cadata->direct_view_schema,
+										   &cadata->direct_view_name,
+										   AccessExclusiveLock);
 
-	/*  END OF LOCKING. Perform actual deletions now. */
+	/* Delete catalog entry */
+	iterator = ts_scan_iterator_create(CONTINUOUS_AGG, RowExclusiveLock, CurrentMemoryContext);
+	init_scan_by_mat_hypertable_id(&iterator, cadata->mat_hypertable_id);
 
-	if (OidIsValid(user_view.objectId))
-		performDeletion(&user_view, DROP_RESTRICT, 0);
-
-	/* Delete catalog entry. */
-	init_scan_by_mat_hypertable_id(&iterator, agg->data.mat_hypertable_id);
 	ts_scanner_foreach(&iterator)
 	{
 		TupleInfo *ti = ts_scan_iterator_tuple_info(&iterator);
@@ -653,30 +555,35 @@ drop_continuous_agg(ContinuousAgg *agg, bool drop_user_view)
 
 		ts_catalog_delete_tid(ti->scanrel, ts_scanner_get_tuple_tid(ti));
 
-		/* delete all related rows */
+		/* Delete all related rows */
 		if (!raw_hypertable_has_other_caggs)
+		{
 			hypertable_invalidation_log_delete(form->raw_hypertable_id);
-
-		completed_threshold_delete(form->mat_hypertable_id);
-
-		if (!raw_hypertable_has_other_caggs)
 			invalidation_threshold_delete(form->raw_hypertable_id);
+		}
+
 		materialization_invalidation_log_delete(form->mat_hypertable_id);
-		count++;
 
 		if (should_free)
 			heap_freetuple(tuple);
 	}
-	Assert(count == 1);
 
-	if (OidIsValid(rawht_trig.objectId))
-		ts_hypertable_drop_trigger(raw_hypertable, CAGGINVAL_TRIGGER_NAME);
+	/* Perform actual deletions now */
+	if (OidIsValid(user_view.objectId))
+		performDeletion(&user_view, DROP_RESTRICT, 0);
 
-	/* delete the materialization table */
-	ts_hypertable_drop(mat_hypertable, DROP_CASCADE);
+	if (OidIsValid(raw_hypertable_trig.objectId))
+		ts_hypertable_drop_trigger(raw_hypertable.objectId, CAGGINVAL_TRIGGER_NAME);
+
+	if (OidIsValid(mat_hypertable.objectId))
+	{
+		performDeletion(&mat_hypertable, DROP_CASCADE, 0);
+		ts_hypertable_delete_by_id(cadata->mat_hypertable_id);
+	}
 
 	if (OidIsValid(partial_view.objectId))
 		performDeletion(&partial_view, DROP_RESTRICT, 0);
+
 	if (OidIsValid(direct_view.objectId))
 		performDeletion(&direct_view, DROP_RESTRICT, 0);
 }
@@ -695,7 +602,6 @@ ts_continuous_agg_drop_hypertable_callback(int32 hypertable_id)
 {
 	ScanIterator iterator =
 		ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
-	ContinuousAgg ca;
 
 	ts_scanner_foreach(&iterator)
 	{
@@ -704,10 +610,8 @@ ts_continuous_agg_drop_hypertable_callback(int32 hypertable_id)
 		FormData_continuous_agg *data = (FormData_continuous_agg *) GETSTRUCT(tuple);
 
 		if (data->raw_hypertable_id == hypertable_id)
-		{
-			continuous_agg_init(&ca, data);
-			drop_continuous_agg(&ca, true);
-		}
+			drop_continuous_agg(data, true);
+
 		if (data->mat_hypertable_id == hypertable_id)
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
@@ -750,7 +654,7 @@ ts_continuous_agg_drop_view_callback(ContinuousAgg *ca, const char *schema, cons
 	switch (vtyp)
 	{
 		case ContinuousAggUserView:
-			drop_continuous_agg(ca, false /* The user view has already been dropped */);
+			drop_continuous_agg(&ca->data, false /* The user view has already been dropped */);
 			break;
 		case ContinuousAggPartialView:
 		case ContinuousAggDirectView:
@@ -792,7 +696,7 @@ ts_continuous_agg_view_type(FormData_continuous_agg *data, const char *schema, c
 			 CHECK_NAME_MATCH(&data->direct_view_name, name))
 		return ContinuousAggDirectView;
 	else
-		return ContinuousAggNone;
+		return ContinuousAggAnyView;
 }
 
 static FormData_continuous_agg *
@@ -988,4 +892,93 @@ ts_continuous_agg_find_integer_now_func_by_materialization_id(int32 mat_htid)
 		raw_htid = find_raw_hypertable_for_materialization(mat_htid);
 	}
 	return par_dim;
+}
+
+typedef struct Watermark
+{
+	int32 hyper_id;
+	int64 value;
+} Watermark;
+
+TS_FUNCTION_INFO_V1(ts_continuous_agg_watermark);
+
+/*
+ * Get the watermark for a real-time aggregation query on a continuous
+ * aggregate.
+ *
+ * The watermark determines where the materialization ends for a continuous
+ * aggregate. It is used by real-time aggregation as the threshold between the
+ * materialized data and real-time data in the UNION query.
+ *
+ * The watermark is defined as the end of the last (highest) bucket in the
+ * materialized hypertable of a continuous aggregate.
+ *
+ * The materialized hypertable ID is given as input argument.
+ */
+Datum
+ts_continuous_agg_watermark(PG_FUNCTION_ARGS)
+{
+	const int32 hyper_id = PG_GETARG_INT32(0);
+	ContinuousAgg *cagg;
+	Hypertable *ht;
+	Dimension *dim;
+	Datum maxdat;
+	bool max_isnull;
+	Watermark *watermark = (Watermark *) fcinfo->flinfo->fn_extra;
+	Oid timetype;
+	AclResult aclresult;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("materialized hypertable cannot be NULL")));
+
+	if (watermark != NULL)
+	{
+		/* The flinfo is probably reset when the input argument changes, but
+		 * the documentation isn't clear on this. Check that the hypertable ID
+		 * matches across repeated calls just to be safe. */
+		if (watermark->hyper_id == hyper_id)
+			PG_RETURN_INT64(watermark->value);
+
+		pfree(watermark);
+	}
+
+	cagg = ts_continuous_agg_find_by_mat_hypertable_id(hyper_id);
+
+	if (NULL == cagg)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid materialized hypertable ID: %d", hyper_id)));
+
+	watermark = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(Watermark));
+	watermark->hyper_id = hyper_id;
+	fcinfo->flinfo->fn_extra = watermark;
+
+	/* Preemptive permission check to ensure the function complains about lack
+	 * of permissions on the cagg rather than the materialized hypertable */
+	aclresult = pg_class_aclcheck(cagg->relid, GetUserId(), ACL_SELECT);
+	aclcheck_error(aclresult, OBJECT_MATVIEW, get_rel_name(cagg->relid));
+
+	ht = ts_hypertable_get_by_id(hyper_id);
+	Assert(NULL != ht);
+	dim = hyperspace_get_open_dimension(ht->space, 0);
+	timetype = ts_dimension_get_partition_type(dim);
+	maxdat = ts_hypertable_get_open_dim_max_value(ht, 0, &max_isnull);
+
+	if (!max_isnull)
+	{
+		int64 value;
+
+		/* Add one bucket to get to the end of the last bucket */
+		value = ts_time_value_to_internal(maxdat, timetype);
+		watermark->value = ts_time_saturating_add(value, cagg->data.bucket_width, timetype);
+	}
+	else
+	{
+		/* Nothing materialized, so return min */
+		watermark->value = ts_time_get_min(timetype);
+	}
+
+	PG_RETURN_INT64(watermark->value);
 }

@@ -29,12 +29,11 @@ SELECT
   max(metric)-min(metric) as metric_spread --We can also use expressions on aggregates and constants
 FROM
   device_readings
-GROUP BY bucket, device_id; --We have to group by the bucket column, but can also add other group-by columns
-NOTICE:  adding index _materialized_hypertable_2_device_id_bucket_idx ON _timescaledb_internal._materialized_hypertable_2 USING BTREE(device_id, bucket)
-SELECT add_refresh_continuous_aggregate_policy('device_summary', NULL, '2 h'::interval, '2 h'::interval);
- add_refresh_continuous_aggregate_policy 
------------------------------------------
-                                    1000
+GROUP BY bucket, device_id WITH NO DATA; --We have to group by the bucket column, but can also add other group-by columns
+SELECT add_continuous_aggregate_policy('device_summary', NULL, '2 h'::interval, '2 h'::interval);
+ add_continuous_aggregate_policy 
+---------------------------------
+                            1000
 (1 row)
 
 --Next, insert some data into the raw hypertable
@@ -48,12 +47,9 @@ SELECT * FROM device_summary;
 --------+-----------+------------+---------------
 (0 rows)
 
---Normally, the continuous view will be updated automatically on a schedule but, you can also do it manually.
---We alter max_interval_per_job too since we are not using background workers
-ALTER MATERIALIZED VIEW device_summary SET (timescaledb.max_interval_per_job = '60 day');
-SET timescaledb.current_timestamp_mock = '2018-12-31 00:00';
-REFRESH MATERIALIZED VIEW device_summary;
-LOG:  materializing continuous aggregate public.device_summary: nothing to invalidate, new range up to Sun Dec 30 22:00:00 2018 PST
+-- Simulate a policy that refreshes with lag, i.e., it doesn't refresh
+-- the entire data set. In this case up to the given date.
+CALL refresh_continuous_aggregate('device_summary', NULL, '2018-12-30 22:00');
 --Now you can run selects over your view as normal
 SELECT * FROM device_summary WHERE metric_spread = 1800 ORDER BY bucket DESC, device_id LIMIT 10;
             bucket            | device_id | metric_avg | metric_spread 
@@ -73,40 +69,21 @@ SELECT * FROM device_summary WHERE metric_spread = 1800 ORDER BY bucket DESC, de
 --You can view informaton about your continuous aggregates. The meaning of these fields will be explained further down.
 \x
 SELECT * FROM timescaledb_information.continuous_aggregates;
--[ RECORD 1 ]------------------+-------------------------------------------------------------------------------------------------------------
-view_name                      | device_summary
-view_owner                     | default_perm_user
-refresh_lag                    | @ 2 hours
-refresh_interval               | @ 2 hours
-max_interval_per_job           | @ 60 days
-ignore_invalidation_older_than | 
-materialized_only              | t
-materialization_hypertable     | _timescaledb_internal._materialized_hypertable_2
-view_definition                |  SELECT time_bucket('@ 1 hour'::interval, device_readings.observation_time) AS bucket,                      +
-                               |     device_readings.device_id,                                                                              +
-                               |     avg(device_readings.metric) AS metric_avg,                                                              +
-                               |     (max(device_readings.metric) - min(device_readings.metric)) AS metric_spread                            +
-                               |    FROM device_readings                                                                                     +
-                               |   GROUP BY (time_bucket('@ 1 hour'::interval, device_readings.observation_time)), device_readings.device_id;
-
---You can also view information about your background workers.
---Note: (some fields are empty because there are no background workers used in tests)
-SELECT * FROM timescaledb_information.continuous_aggregate_stats;
--[ RECORD 1 ]----------+-----------------------------
-view_name              | device_summary
-completed_threshold    | Sun Dec 30 22:00:00 2018 PST
-invalidation_threshold | Sun Dec 30 22:00:00 2018 PST
-job_id                 | 
-last_run_started_at    | 
-last_successful_finish | 
-last_run_status        | 
-job_status             | 
-last_run_duration      | 
-next_scheduled_run     | 
-total_runs             | 
-total_successes        | 
-total_failures         | 
-total_crashes          | 
+-[ RECORD 1 ]---------------------+-------------------------------------------------------------------------------------------------------------
+hypertable_schema                 | public
+hypertable_name                   | device_readings
+view_schema                       | public
+view_name                         | device_summary
+view_owner                        | default_perm_user
+materialized_only                 | t
+materialization_hypertable_schema | _timescaledb_internal
+materialization_hypertable_name   | _materialized_hypertable_2
+view_definition                   |  SELECT time_bucket('@ 1 hour'::interval, device_readings.observation_time) AS bucket,                      +
+                                  |     device_readings.device_id,                                                                              +
+                                  |     avg(device_readings.metric) AS metric_avg,                                                              +
+                                  |     (max(device_readings.metric) - min(device_readings.metric)) AS metric_spread                            +
+                                  |    FROM device_readings                                                                                     +
+                                  |   GROUP BY (time_bucket('@ 1 hour'::interval, device_readings.observation_time)), device_readings.device_id;
 
 \x
 -- Refresh interval
@@ -121,9 +98,9 @@ SELECT schedule_interval FROM _timescaledb_config.bgw_job WHERE id = 1000;
 
 -- You can change this setting with ALTER VIEW (equivalently, specify in WITH clause of CREATE VIEW)
 SELECT alter_job(1000, schedule_interval := '1h');
-                                                                 alter_job                                                                  
---------------------------------------------------------------------------------------------------------------------------------------------
- (1000,"@ 1 hour","@ 0",-1,"@ 2 hours",t,"{""end_interval"": ""@ 2 hours"", ""start_interval"": null, ""mat_hypertable_id"": 2}",-infinity)
+                                                               alter_job                                                                
+----------------------------------------------------------------------------------------------------------------------------------------
+ (1000,"@ 1 hour","@ 0",-1,"@ 2 hours",t,"{""end_offset"": ""@ 2 hours"", ""start_offset"": null, ""mat_hypertable_id"": 2}",-infinity)
 (1 row)
 
 SELECT schedule_interval FROM _timescaledb_config.bgw_job WHERE id = 1000;
@@ -133,18 +110,11 @@ SELECT schedule_interval FROM _timescaledb_config.bgw_job WHERE id = 1000;
 (1 row)
 
 --
--- Refresh lag
+-- Refresh with lag
 --
--- Materialization have a refresh lag, which means that the materialization will not contain
--- the most up-to-date data.
--- Namely, it will only contain data where: bucket end < (max(time)-refresh_lag)
---By default refresh_lag is 2 x bucket_width
-SELECT refresh_lag FROM timescaledb_information.continuous_aggregates;
- refresh_lag 
--------------
- @ 2 hours
-(1 row)
-
+-- It is possible to use a policy or manual refresh with a lag, which
+-- means the materialization will not contain the most up-to-date
+-- data.
 SELECT max(observation_time) FROM device_readings;
              max              
 ------------------------------
@@ -157,13 +127,7 @@ SELECT max(bucket) FROM device_summary;
  Sun Dec 30 21:00:00 2018 PST
 (1 row)
 
---You can change the refresh_lag (equivalently, specify in WITH clause of CREATE VIEW)
---Negative values create materialization where the bucket ends after the max of the raw data.
---So to have you data always up-to-date make the refresh_lag (-bucket_width). Note this
---will slow down your inserts because of invalidation.
-ALTER MATERIALIZED VIEW device_summary SET (timescaledb.refresh_lag = '-1 hour');
-REFRESH MATERIALIZED VIEW device_summary;
-LOG:  materializing continuous aggregate public.device_summary: nothing to invalidate, new range up to Mon Dec 31 01:00:00 2018 PST
+CALL refresh_continuous_aggregate('device_summary', NULL, '2018-12-31 01:00');
 SELECT max(observation_time) FROM device_readings;
              max              
 ------------------------------
@@ -195,10 +159,7 @@ SELECT * FROM device_summary WHERE device_id = 'device_1' and bucket = 'Sun Dec 
  Sun Dec 30 13:00:00 2018 PST | device_1  | 1546175700 |          1800
 (1 row)
 
-SET timescaledb.current_timestamp_mock = 'Sun Dec 30 13:01:00 2018 PST';
-REFRESH MATERIALIZED VIEW device_summary;
-LOG:  new materialization range not found for public.device_readings (time column observation_time): not enough new data past completion threshold of Mon Dec 31 01:00:00 2018 PST as of Sun Dec 30 13:01:00 2018 PST
-LOG:  materializing continuous aggregate public.device_summary: processing invalidations, no new range
+CALL refresh_continuous_aggregate('device_summary', NULL, NULL);
 --But is reflected after.
 SELECT * FROM device_summary WHERE device_id = 'device_1' and bucket = 'Sun Dec 30 13:00:00 2018 PST';
             bucket            | device_id |    metric_avg    | metric_spread 
@@ -226,8 +187,8 @@ SELECT
   max(metric)-min(metric) as metric_spread
 FROM
   device_readings
-GROUP BY bucket, device_id;
-ERROR:  only immutable functions are supported for continuous aggregate query
+GROUP BY bucket, device_id WITH NO DATA;
+ERROR:  only immutable functions supported in continuous aggregate view
 --note the error.
 -- You have two options:
 -- Option 1: be explicit in your timezone:
@@ -244,8 +205,7 @@ SELECT
   max(metric)-min(metric) as metric_spread
 FROM
   device_readings
-GROUP BY bucket, device_id;
-NOTICE:  adding index _materialized_hypertable_3_device_id_bucket_idx ON _timescaledb_internal._materialized_hypertable_3 USING BTREE(device_id, bucket)
+GROUP BY bucket, device_id WITH NO DATA;
 DROP MATERIALIZED VIEW device_summary;
 -- Option 2: Keep things as TIMESTAMPTZ in the view and convert to local time when
 -- querying from the view
@@ -262,12 +222,8 @@ SELECT
   max(metric)-min(metric) as metric_spread
 FROM
   device_readings
-GROUP BY bucket, device_id;
-NOTICE:  adding index _materialized_hypertable_4_device_id_bucket_idx ON _timescaledb_internal._materialized_hypertable_4 USING BTREE(device_id, bucket)
-REFRESH MATERIALIZED VIEW device_summary;
-LOG:  new materialization range for public.device_readings (time column observation_time) larger than allowed in one run, truncating Sun Dec 30 11:00:00 2018 PST to Sat Dec 01 20:00:00 2018 PST
-LOG:  materializing continuous aggregate public.device_summary: nothing to invalidate, new range up to Sat Dec 01 20:00:00 2018 PST
-WARNING:  REFRESH did not materialize the entire range since it was limited by the max_interval_per_job setting
+GROUP BY bucket, device_id WITH DATA;
+NOTICE:  refreshing continuous aggregate "device_summary"
 SELECT min(min_time)::timestamp FROM device_summary;
            min            
 --------------------------
@@ -300,11 +256,11 @@ SELECT set_integer_now_func('device_readings_int','device_readings_int_now');
 CREATE MATERIALIZED VIEW device_readings_mat_only
   WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 AS
-  SELECT time_bucket(10,time), avg(value) FROM device_readings_int GROUP BY 1;
+  SELECT time_bucket(10,time), avg(value) FROM device_readings_int GROUP BY 1 WITH NO DATA;
 CREATE MATERIALIZED VIEW device_readings_jit
   WITH (timescaledb.continuous, timescaledb.materialized_only=false)
 AS
-  SELECT time_bucket(10,time), avg(value) FROM device_readings_int GROUP BY 1;
+  SELECT time_bucket(10,time), avg(value) FROM device_readings_int GROUP BY 1 WITH NO DATA;
 INSERT INTO device_readings_int SELECT i, i*10 FROM generate_series(10,40,10) AS g(i);
 -- materialization only should have 0 rows
 SELECT * FROM device_readings_mat_only ORDER BY time_bucket;
@@ -322,10 +278,10 @@ SELECT * FROM device_readings_jit ORDER BY time_bucket;
           40 | 400
 (4 rows)
 
-REFRESH MATERIALIZED VIEW device_readings_mat_only;
-LOG:  materializing continuous aggregate public.device_readings_mat_only: nothing to invalidate, new range up to 30
-REFRESH MATERIALIZED VIEW device_readings_jit;
-LOG:  materializing continuous aggregate public.device_readings_jit: nothing to invalidate, new range up to 30
+-- simulate a refresh policy with lag, i.e., one that doesn't refresh
+-- up to the latest data. Max value is 40.
+CALL refresh_continuous_aggregate('device_readings_mat_only', NULL, 30);
+CALL refresh_continuous_aggregate('device_readings_jit', NULL, 30);
 -- materialization only should have 2 rows
 SELECT * FROM device_readings_mat_only ORDER BY time_bucket;
  time_bucket | avg 
@@ -373,10 +329,8 @@ $BODY$
   SELECT 100;
 $BODY$;
 -- refresh should materialize all now
-REFRESH MATERIALIZED VIEW device_readings_mat_only;
-LOG:  materializing continuous aggregate public.device_readings_mat_only: nothing to invalidate, new range up to 70
-REFRESH MATERIALIZED VIEW device_readings_jit;
-LOG:  materializing continuous aggregate public.device_readings_jit: nothing to invalidate, new range up to 70
+CALL refresh_continuous_aggregate('device_readings_mat_only', NULL, NULL);
+CALL refresh_continuous_aggregate('device_readings_jit', NULL, NULL);
 -- materialization only should have 6 rows
 SELECT * FROM device_readings_mat_only ORDER BY time_bucket;
  time_bucket | avg 
@@ -413,13 +367,13 @@ SELECT * FROM create_hypertable('whatever', 'time');
 
 CREATE MATERIALIZED VIEW whatever_summary WITH (timescaledb.continuous) AS
 SELECT time_bucket('1 hour', time) AS bucket, avg(metric)
-  FROM whatever GROUP BY bucket;
+  FROM whatever GROUP BY bucket WITH NO DATA;
 SELECT (SELECT format('%1$I.%2$I', schema_name, table_name)::regclass::oid
           FROM _timescaledb_catalog.hypertable
-	 WHERE id = raw_hypertable_id) AS raw_table
+     WHERE id = raw_hypertable_id) AS raw_table
      , (SELECT format('%1$I.%2$I', schema_name, table_name)::regclass::oid
           FROM _timescaledb_catalog.hypertable
-	 WHERE id = mat_hypertable_id) AS mat_table
+     WHERE id = mat_hypertable_id) AS mat_table
 FROM _timescaledb_catalog.continuous_agg
 WHERE user_view_name = 'whatever_summary' \gset
 SELECT relname FROM pg_class WHERE oid = :mat_table;

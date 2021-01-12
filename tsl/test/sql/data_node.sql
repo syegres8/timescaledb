@@ -71,13 +71,13 @@ ALTER SERVER data_node_1 OWNER TO CURRENT_USER;
 \set ON_ERROR_STOP 1
 
 -- List foreign data nodes
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 -- Delete a data node
 SELECT * FROM delete_data_node('data_node_3');
 
 -- List data nodes
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 \set ON_ERROR_STOP 0
 -- Deleting a non-existing data node generates error
@@ -87,13 +87,13 @@ SELECT * FROM delete_data_node('data_node_3');
 -- Deleting non-existing data node with "if_exists" set does not generate error
 SELECT * FROM delete_data_node('data_node_3', if_exists => true);
 
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 SELECT * FROM delete_data_node('data_node_1');
 SELECT * FROM delete_data_node('data_node_2');
 
 -- No data nodes left
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 -- Cleanup databases
 RESET ROLE;
@@ -119,7 +119,7 @@ GRANT USAGE
    TO :ROLE_1;
 
 SELECT node_name, "options"
-  FROM timescaledb_information.data_node
+  FROM timescaledb_information.data_nodes
 ORDER BY node_name;
 
 SELECT object_name, object_type, ARRAY_AGG(privilege_type)
@@ -182,7 +182,7 @@ FROM _timescaledb_catalog.hypertable WHERE table_name = 'disttable'; $$);
 INSERT INTO disttable VALUES ('2019-02-02 10:45', 1, 23.4);
 
 -- Chunk mapping created
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 DROP TABLE disttable;
 
@@ -380,7 +380,7 @@ SELECT * FROM create_distributed_hypertable('disttable', 'time', data_nodes => '
 
 SET ROLE :ROLE_CLUSTER_SUPERUSER;
 SELECT * FROM delete_data_node('data_node_1');
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 SELECT * FROM test.show_subtables('disttable');
 SELECT * FROM _timescaledb_catalog.hypertable_data_node;
@@ -399,7 +399,7 @@ DROP DATABASE data_node_3;
 DROP DATABASE data_node_4;
 
 -- there should be no data nodes
-SELECT node_name, "options" FROM timescaledb_information.data_node ORDER BY node_name;
+SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
 
 -- let's add some
 SELECT * FROM add_data_node('data_node_1', host => 'localhost',
@@ -440,10 +440,10 @@ CREATE TABLE devices(device int, name text);
 SELECT * FROM _timescaledb_catalog.hypertable_data_node;
 
 -- Block one data node for specific hypertable
-SELECT * FROM block_new_chunks('data_node_1', 'disttable');
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_1', 'disttable');
 
 -- Block one data node for all hypertables
-SELECT * FROM block_new_chunks('data_node_1');
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_1');
 
 SELECT * FROM _timescaledb_catalog.hypertable_data_node;
 
@@ -459,22 +459,22 @@ SELECT * FROM _timescaledb_catalog.chunk_data_node;
 -- some ERROR cases
 \set ON_ERROR_STOP 0
 -- Will error due to under-replication
-SELECT * FROM block_new_chunks('data_node_2');
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_2');
 -- can't block/allow non-existing data node
-SELECT * FROM block_new_chunks('data_node_12345', 'disttable');
-SELECT * FROM allow_new_chunks('data_node_12345', 'disttable');
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_12345', 'disttable');
+SELECT * FROM _timescaledb_internal.allow_new_chunks('data_node_12345', 'disttable');
 -- NULL data node
-SELECT * FROM block_new_chunks(NULL, 'disttable');
-SELECT * FROM allow_new_chunks(NULL, 'disttable');
+SELECT * FROM _timescaledb_internal.block_new_chunks(NULL, 'disttable');
+SELECT * FROM _timescaledb_internal.allow_new_chunks(NULL, 'disttable');
 -- can't block/allow on non hypertable
-SELECT * FROM block_new_chunks('data_node_1', 'devices');
-SELECT * FROM allow_new_chunks('data_node_1', 'devices');
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_1', 'devices');
+SELECT * FROM _timescaledb_internal.allow_new_chunks('data_node_1', 'devices');
 \set ON_ERROR_STOP 1
 
 -- Force block all data nodes
-SELECT * FROM block_new_chunks('data_node_2', force => true);
-SELECT * FROM block_new_chunks('data_node_1', force => true);
-SELECT * FROM block_new_chunks('data_node_3', force => true);
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_2', force => true);
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_1', force => true);
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_3', force => true);
 
 -- All data nodes are blocked
 SELECT * FROM _timescaledb_catalog.hypertable_data_node;
@@ -485,9 +485,9 @@ INSERT INTO disttable VALUES ('2019-11-02 02:45', 1, 13.3);
 \set ON_ERROR_STOP 1
 
 -- unblock data nodes for all hypertables
-SELECT * FROM allow_new_chunks('data_node_1');
-SELECT * FROM allow_new_chunks('data_node_2');
-SELECT * FROM allow_new_chunks('data_node_3');
+SELECT * FROM _timescaledb_internal.allow_new_chunks('data_node_1');
+SELECT * FROM _timescaledb_internal.allow_new_chunks('data_node_2');
+SELECT * FROM _timescaledb_internal.allow_new_chunks('data_node_3');
 
 SELECT table_name, node_name, block_chunks
 FROM _timescaledb_catalog.hypertable_data_node dn,
@@ -508,11 +508,15 @@ SELECT * FROM detach_data_node(NULL, 'disttable');
 SELECT * FROM detach_data_node('data_node_1');
 -- can't detach already detached data node
 SELECT * FROM detach_data_node('data_node_2', 'disttable_2');
+SELECT * FROM detach_data_node('data_node_2', 'disttable_2', if_attached => false);
 -- can't detach b/c of replication factor for disttable_2
 SELECT * FROM detach_data_node('data_node_3', 'disttable_2');
 -- can't detach non hypertable
 SELECT * FROM detach_data_node('data_node_3', 'devices');
 \set ON_ERROR_STOP 1
+
+-- do nothing if node is not attached
+SELECT * FROM detach_data_node('data_node_2', 'disttable_2', if_attached => true);
 
 -- force detach data node to become under-replicated for new data
 SELECT * FROM detach_data_node('data_node_3', 'disttable_2', force => true);
@@ -547,7 +551,7 @@ SELECT foreign_table_name, foreign_server_name
 FROM information_schema.foreign_tables
 ORDER BY foreign_table_name;
 
-SELECT * FROM detach_data_node('data_node_2', 'disttable', true);
+SELECT * FROM detach_data_node('data_node_2', 'disttable', force => true);
 
 -- Let's add more data nodes
 SET ROLE :ROLE_CLUSTER_SUPERUSER;
@@ -566,8 +570,8 @@ SELECT * FROM create_distributed_hypertable('disttable_4', 'time', replication_f
 \set ON_ERROR_STOP 0
 -- error due to missing permissions
 SELECT * FROM detach_data_node('data_node_4', 'disttable_3');
-SELECT * FROM block_new_chunks('data_node_4', 'disttable_3');
-SELECT * FROM allow_new_chunks('data_node_4', 'disttable_3');
+SELECT * FROM _timescaledb_internal.block_new_chunks('data_node_4', 'disttable_3');
+SELECT * FROM _timescaledb_internal.allow_new_chunks('data_node_4', 'disttable_3');
 \set ON_ERROR_STOP 1
 
 -- detach table(s) where user has permissions, otherwise show NOTICE
@@ -656,9 +660,42 @@ SELECT * FROM add_data_node('data_node_1', 'localhost', database => 'data_node_1
 SELECT * FROM add_data_node('data_node_99', host => 'localhost');
 \set ON_ERROR_STOP 1
 
+
+-- Test adding bootstrapped data node where extension owner is different from user adding a data node
+SET ROLE :ROLE_CLUSTER_SUPERUSER;
+CREATE DATABASE data_node_6;
+\c data_node_6
+SET client_min_messages = ERROR;
+-- Creating an extension as superuser
+CREATE EXTENSION timescaledb;
+RESET client_min_messages;
+
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_3;
+-- Trying to add data node as non-superuser without GRANT on the
+-- foreign data wrapper will fail.
+\set ON_ERROR_STOP 0
+SELECT * FROM add_data_node('data_node_6', host => 'localhost', database => 'data_node_6');
+\set ON_ERROR_STOP 0
+
+RESET ROLE;
+GRANT USAGE ON FOREIGN DATA WRAPPER timescaledb_fdw TO :ROLE_3;
+SET ROLE :ROLE_3;
+
+\set ON_ERROR_STOP 0
+-- ROLE_3 doesn't have a password in the passfile and has not way to
+-- authenticate so adding a data node will still fail.
+SELECT * FROM add_data_node('data_node_6', host => 'localhost', database => 'data_node_6');
+\set ON_ERROR_STOP 0
+
+-- Providing the password on the command line should work
+SELECT * FROM add_data_node('data_node_6', host => 'localhost', database => 'data_node_6', password => :'ROLE_3_PASS');
+
+
 RESET ROLE;
 DROP DATABASE data_node_1;
 DROP DATABASE data_node_2;
 DROP DATABASE data_node_3;
 DROP DATABASE data_node_4;
 DROP DATABASE data_node_5;
+DROP DATABASE data_node_6;

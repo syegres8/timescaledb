@@ -39,7 +39,6 @@
 #include "hypertable_cache.h"
 #include "hypertable_compression.h"
 #include "custom_type_cache.h"
-#include "license.h"
 #include "trigger.h"
 #include "utils.h"
 
@@ -66,7 +65,7 @@ static void compresscolinfo_add_catalog_entries(CompressColInfo *compress_cols, 
 		{                                                                                          \
 			ereport(ERROR,                                                                         \
 					(errcode(ERRCODE_INTERNAL_ERROR),                                              \
-					 errmsg(" bad compression hypertable internal name")));                        \
+					 errmsg("bad compression hypertable internal name")));                         \
 		}                                                                                          \
 	} while (0);
 
@@ -173,9 +172,8 @@ compresscolinfo_add_metadata_columns(CompressColInfo *cc, Relation uncompressed_
 			if (!OidIsValid(type->lt_opr))
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("invalid order by column type: could not identify an less-than "
-								"operator for type %s",
-								format_type_be(attr->atttypid))));
+						 errmsg("invalid ordering column type %s", format_type_be(attr->atttypid)),
+						 errdetail("Could not identify a less-than operator for the type.")));
 
 			/* segment_meta min and max columns */
 			cc->coldeflist =
@@ -235,9 +233,9 @@ compresscolinfo_init(CompressColInfo *cc, Oid srctbl_relid, List *segmentby_cols
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("column \"%s\" specified in option timescaledb.compress_segmentby does "
-							"not exist",
-							NameStr(col->colname))));
+					 errmsg("column \"%s\" does not exist", NameStr(col->colname)),
+					 errhint("The timescaledb.compress_segmentby option must reference a valid "
+							 "column.")));
 		}
 		segorder_colindex[col_attno - 1] = i++;
 	}
@@ -248,22 +246,23 @@ compresscolinfo_init(CompressColInfo *cc, Oid srctbl_relid, List *segmentby_cols
 	{
 		CompressedParsedCol *col = (CompressedParsedCol *) lfirst(lc);
 		AttrNumber col_attno = get_attnum(rel->rd_id, NameStr(col->colname));
+
 		if (col_attno == InvalidAttrNumber)
-		{
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("column \"%s\" in option timescaledb.compress_orderby does not exist",
-							NameStr(col->colname))));
-		}
+					 errmsg("column \"%s\" does not exist", NameStr(col->colname)),
+					 errhint("The timescaledb.compress_orderby option must reference a valid "
+							 "column.")));
+
 		/* check if orderby_cols and segmentby_cols are distinct */
 		if (segorder_colindex[col_attno - 1] != 0)
-		{
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("cannot use column \"%s\" in both timescaledb.compress_orderby and "
-							"timescaledb.compress_segmentby",
-							NameStr(col->colname))));
-		}
+					 errmsg("cannot use column \"%s\" for both ordering and segmenting",
+							NameStr(col->colname)),
+					 errhint("Use separate columns for the timescaledb.compress_orderby and"
+							 " timescaledb.compress_segmentby options.")));
+
 		segorder_colindex[col_attno - 1] = i++;
 	}
 
@@ -430,7 +429,7 @@ create_compressed_table_indexes(Oid compresstable_relid, CompressColInfo *compre
 		if (!HeapTupleIsValid(index_tuple))
 			elog(ERROR, "cache lookup failed for index relid %d", index_addr.objectId);
 		index_name = ((Form_pg_class) GETSTRUCT(index_tuple))->relname;
-		elog(NOTICE,
+		elog(DEBUG1,
 			 "adding index %s ON %s.%s USING BTREE(%s, %s)",
 			 NameStr(index_name),
 			 NameStr(ht->fd.schema_name),
@@ -768,34 +767,25 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 				{
 					/* is this a segment-by column */
 					if (col_def->segmentby_column_index < 1)
-					{
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("constraint \"%s\" requires column \"%s\" to be a "
-										"timescaledb.compress_segmentby "
-										"column for compression",
-										NameStr(form->conname),
+								 errmsg("column \"%s\" must be used for segmenting",
 										NameStr(col_def->attname)),
-								 errhint("Only segment by columns can be used in foreign key "
-										 "constraints on hypertables that are compressed.")));
-					}
+								 errdetail("The foreign key constraint \"%s\" cannot be"
+										   " enforced with the given compression configuration.",
+										   NameStr(form->conname))));
 				}
-				else
-				{
-					/* is colno  a segment-by or order_by column */
-					if (col_def->segmentby_column_index < 1 && col_def->orderby_column_index < 1)
-						ereport(ERROR,
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("constraint \"%s\" requires column \"%s\" to be a "
-										"timescaledb.compress_segmentby or "
-										"timescaledb.compress_orderby column for compression",
-										NameStr(form->conname),
-										NameStr(col_def->attname)),
-								 errhint("Only columns specified in timescaledb.compress_segmentby "
-										 "and timescaledb.compress_orderby can be used in "
-										 "constraints on hypertables that are compressed.")));
-				}
+				/* is colno a segment-by or order_by column */
+				else if (col_def->segmentby_column_index < 1 && col_def->orderby_column_index < 1)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("column \"%s\" must be used for segmenting or ordering",
+									NameStr(col_def->attname)),
+							 errdetail("The constraint \"%s\" cannot be enforced with"
+									   " the given compression configuration.",
+									   NameStr(form->conname))));
 			}
+
 			if (form->contype == CONSTRAINT_FOREIGN)
 			{
 				Name conname = palloc0(NAMEDATALEN);
@@ -815,15 +805,16 @@ check_modify_compression_options(Hypertable *ht, WithClauseResult *with_clause_o
 {
 	bool compress_enable = DatumGetBool(with_clause_options[CompressEnabled].parsed);
 	bool compressed_chunks_exist;
-	bool compression_already_enabled = TS_HYPERTABLE_HAS_COMPRESSION(ht);
+	bool compression_already_enabled = TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht);
 	compressed_chunks_exist =
 		compression_already_enabled && ts_chunk_exists_with_compression(ht->fd.id);
 
 	if (compressed_chunks_exist)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot change compression options as compressed chunks already exist for "
-						"this table")));
+				 errmsg("cannot change configuration on already compressed chunks"),
+				 errdetail("There are compressed chunks that prevent changing"
+						   " the existing compression configuration.")));
 
 	/* Require both order by and segment by when altering if they were previously set because
 	 * otherwise it's not clear what the default value means: does it mean leave as-is or is it an
@@ -846,14 +837,18 @@ check_modify_compression_options(Hypertable *ht, WithClauseResult *with_clause_o
 		if (with_clause_options[CompressOrderBy].is_default && order_by_set)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg(
-						 "need to specify timescaledb.compress_orderby if it was previously set")));
+					 errmsg("must specify a column to order by"),
+					 errdetail("The timescaledb.compress_orderby option was"
+							   " previously set and must also be specified"
+							   " in the updated configuration.")));
 
 		if (with_clause_options[CompressSegmentBy].is_default && segment_by_set)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("need to specify timescaledb.compress_segmentby if it was previously "
-							"set")));
+					 errmsg("must specify a column to segment by"),
+					 errdetail("The timescaledb.compress_segmentby option was"
+							   " previously set and must also be specified"
+							   " in the updated configuration.")));
 	}
 }
 
@@ -862,31 +857,46 @@ drop_existing_compression_table(Hypertable *ht)
 {
 	Hypertable *compressed = ts_hypertable_get_by_id(ht->fd.compressed_hypertable_id);
 	if (compressed == NULL)
-		elog(ERROR, "compression enabled but no compressed hypertable found");
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("compressed hypertable not found"),
+				 errdetail("compression was enabled on \"%s\", but its internal"
+						   " compressed hypertable could not be found.",
+						   NameStr(ht->fd.table_name))));
+
 	/* need to drop the old compressed hypertable in case the segment by columns changed (and
 	 * thus the column types of compressed hypertable need to change) */
 	ts_hypertable_drop(compressed, DROP_RESTRICT);
 	ts_hypertable_compression_delete_by_hypertable_id(ht->fd.id);
-	ts_hypertable_unset_compressed_id(ht);
+	ts_hypertable_unset_compressed(ht);
 }
 
 static bool
 disable_compression(Hypertable *ht, WithClauseResult *with_clause_options)
 {
-	bool compression_already_enabled = TS_HYPERTABLE_HAS_COMPRESSION(ht);
+	bool compression_already_enabled = TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht);
 	if (!with_clause_options[CompressOrderBy].is_default ||
 		!with_clause_options[CompressSegmentBy].is_default)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot set additional compression options when disabling compression")));
+				 errmsg("invalid compression configuration"),
+				 errdetail("Cannot set additional compression options when"
+						   " disabling compression.")));
 
 	if (!compression_already_enabled)
 		/* compression is not enabled, so just return */
 		return false;
 	/* compression is enabled. can we turn it off? */
 	check_modify_compression_options(ht, with_clause_options);
-	drop_existing_compression_table(ht);
-	ts_hypertable_unset_compressed_id(ht);
+
+	/* distributed hypertables do not have compression table on the access node */
+	if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
+		drop_existing_compression_table(ht);
+	else
+	{
+		ts_hypertable_compression_delete_by_hypertable_id(ht->fd.id);
+		ts_hypertable_unset_compressed(ht);
+	}
 	return true;
 }
 
@@ -918,9 +928,9 @@ tsl_process_compress_table(AlterTableCmd *cmd, Hypertable *ht,
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("continuous aggregate tables do not support compression")));
+				 errmsg("continuous aggregates do not support compression")));
 	}
-	if (ht->fd.compressed)
+	if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -941,7 +951,7 @@ tsl_process_compress_table(AlterTableCmd *cmd, Hypertable *ht,
 	{
 		return disable_compression(ht, with_clause_options);
 	}
-	if (TS_HYPERTABLE_HAS_COMPRESSION(ht))
+	if (TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht))
 		check_modify_compression_options(ht, with_clause_options);
 
 	ownerid = ts_rel_get_owner(ht->main_table_relid);
@@ -957,7 +967,7 @@ tsl_process_compress_table(AlterTableCmd *cmd, Hypertable *ht,
 	LockRelationOid(catalog_get_table_id(ts_catalog_get(), HYPERTABLE_COMPRESSION),
 					RowExclusiveLock);
 
-	if (TS_HYPERTABLE_HAS_COMPRESSION(ht))
+	if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
 	{
 		/* compression is enabled */
 		drop_existing_compression_table(ht);
@@ -968,11 +978,15 @@ tsl_process_compress_table(AlterTableCmd *cmd, Hypertable *ht,
 		/* On a distributed hypertable, there's no data locally, so don't
 		 * create local compression tables and data but let the DDL pass on to
 		 * data nodes. */
+		ts_hypertable_set_compressed(ht, 0);
+		compresscolinfo_add_catalog_entries(&compress_cols, ht->fd.id);
 		return true;
 	}
-
-	compress_htid = create_compression_table(ownerid, &compress_cols);
-	ts_hypertable_set_compressed_id(ht, compress_htid);
+	else
+	{
+		compress_htid = create_compression_table(ownerid, &compress_cols);
+		ts_hypertable_set_compressed(ht, compress_htid);
+	}
 
 	compresscolinfo_add_catalog_entries(&compress_cols, ht->fd.id);
 	/*add the constraints to the new compressed hypertable */

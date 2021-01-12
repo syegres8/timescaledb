@@ -70,7 +70,8 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 			 * is_foreign_expr would detect volatile expressions as well, but
 			 * checking ec_has_volatile here saves some cycles.
 			 */
-			if (pathkey_ec->ec_has_volatile || !(em_expr = find_em_expr_for_rel(pathkey_ec, rel)) ||
+			if (pathkey_ec->ec_has_volatile ||
+				!(em_expr = ts_find_em_expr_for_rel(pathkey_ec, rel)) ||
 				!is_foreign_expr(root, rel, em_expr))
 			{
 				query_pathkeys_ok = false;
@@ -332,7 +333,7 @@ fdw_scan_info_init(ScanInfo *scaninfo, PlannerInfo *root, RelOptInfo *rel, Path 
  * For a join relation, FDW-specific information about the inner and outer
  * relations is provided using fpinfo_i and fpinfo_o.  For an upper relation,
  * fpinfo_o provides the information for the input relation; fpinfo_i is
- * expected to NULL.
+ * expected to be NULL.
  */
 static void
 merge_fdw_options(TsFdwRelInfo *fpinfo, const TsFdwRelInfo *fpinfo_o, const TsFdwRelInfo *fpinfo_i)
@@ -348,7 +349,7 @@ merge_fdw_options(TsFdwRelInfo *fpinfo, const TsFdwRelInfo *fpinfo_o, const TsFd
 	Assert(fpinfo_i == NULL);
 
 	/*
-	 * Copy the server specific FDW options.  (For a join, both relations come
+	 * Copy the server specific FDW options. (For a join, both relations come
 	 * from the same server, so the server options should have the same value
 	 * for both relations.)
 	 */

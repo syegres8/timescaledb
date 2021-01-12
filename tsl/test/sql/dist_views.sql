@@ -23,9 +23,10 @@ SET client_min_messages TO NOTICE;
 SET ROLE :ROLE_1;
 SELECT setseed(1);
 
-CREATE TABLE dist_table(time timestamptz, device int, temp float);
+CREATE TABLE dist_table(time timestamptz NOT NULL, device int, temp float, timedim date NOT NULL);
 SELECT create_distributed_hypertable('dist_table', 'time', 'device', replication_factor => 2);
-INSERT INTO dist_table SELECT t, (abs(timestamp_hash(t::timestamp)) % 10) + 1, 80
+SELECT add_dimension('dist_table', 'timedim', chunk_time_interval=>'7 days'::interval);
+INSERT INTO dist_table SELECT t, (abs(timestamp_hash(t::timestamp)) % 10) + 1, 80, '2020-01-01'
 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-04 1:00', '1 hour') t;
 ALTER TABLE dist_table SET (timescaledb.compress, timescaledb.compress_segmentby='device', timescaledb.compress_orderby = 'time DESC');
 
@@ -37,7 +38,7 @@ ORDER BY chunk
 LIMIT 1;
 
 SELECT * FROM timescaledb_information.hypertables
-WHERE table_name = 'dist_table';
+WHERE hypertable_name = 'dist_table';
 SELECT * from timescaledb_information.chunks 
 ORDER BY hypertable_name, chunk_name;
 SELECT * from timescaledb_information.dimensions 

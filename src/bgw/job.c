@@ -19,6 +19,7 @@
 #include <storage/proc.h>
 #include <storage/procarray.h>
 #include <storage/sinvaladt.h>
+#include <utils/acl.h>
 #include <utils/elog.h>
 #include <utils/jsonb.h>
 
@@ -60,6 +61,7 @@ GetLockConflictsCompat(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 
 static scheduler_test_hook_type scheduler_test_hook = NULL;
 static char *job_entrypoint_function_name = "ts_bgw_job_entrypoint";
+static bool is_telemetry_job(BgwJob *job);
 
 typedef enum JobLockLifetime
 {
@@ -186,6 +188,13 @@ ts_bgw_job_get_scheduled(size_t alloc_size, MemoryContext mctx)
 		if (should_free)
 			heap_freetuple(tuple);
 
+		/* ignore telemetry jobs if telemetry is disabled */
+		if (!ts_telemetry_on() && is_telemetry_job(job))
+		{
+			pfree(job);
+			continue;
+		}
+
 		/* handle NULL columns */
 		value = slot_getattr(ti->slot, Anum_bgw_job_hypertable_id, &isnull);
 		job->fd.hypertable_id = isnull ? 0 : DatumGetInt32(value);
@@ -203,6 +212,27 @@ ts_bgw_job_get_scheduled(size_t alloc_size, MemoryContext mctx)
 	}
 
 	return jobs;
+}
+
+List *
+ts_bgw_job_get_all(size_t alloc_size, MemoryContext mctx)
+{
+	Catalog *catalog = ts_catalog_get();
+	AccumData list_data = {
+		.list = NIL,
+		.alloc_size = sizeof(BgwJob),
+	};
+	ScannerCtx scanctx = {
+		.table = catalog_get_table_id(catalog, BGW_JOB),
+		.data = &list_data,
+		.tuple_found = bgw_job_accum_tuple_found,
+		.lockmode = AccessShareLock,
+		.result_mctx = mctx,
+		.scandirection = ForwardScanDirection,
+	};
+
+	ts_scanner_scan(&scanctx);
+	return list_data.list;
 }
 
 static void
@@ -453,7 +483,7 @@ get_job_lock_for_delete(int32 job_id)
 	 * equivalent of a row-based FOR UPDATE lock */
 	got_lock = lock_job(job_id,
 						AccessExclusiveLock,
-						/* session_lock */ false,
+						TXN_LOCK,
 						&tag,
 						/* block */ false);
 	if (!got_lock)
@@ -479,7 +509,7 @@ get_job_lock_for_delete(int32 job_id)
 		/* We have to grab this lock before proceeding so grab it in a blocking manner now */
 		got_lock = lock_job(job_id,
 							AccessExclusiveLock,
-							/* session lock */ false,
+							TXN_LOCK,
 							&tag,
 							/* block */ true);
 	}
@@ -891,87 +921,4 @@ ts_bgw_job_insert_relation(Name application_name, Name job_type, Interval *sched
 
 	table_close(rel, RowExclusiveLock);
 	return values[AttrNumberGetAttrOffset(Anum_bgw_job_id)];
-}
-
-static ScanTupleResult
-bgw_job_tuple_update_by_id(TupleInfo *ti, void *const data)
-{
-	BgwJob *updated_job = (BgwJob *) data;
-	bool should_free;
-	HeapTuple tuple = ts_scanner_fetch_heap_tuple(ti, false, &should_free);
-	HeapTuple new_tuple = heap_copytuple(tuple);
-	FormData_bgw_job *fd = (FormData_bgw_job *) GETSTRUCT(new_tuple);
-	TimestampTz next_start;
-
-	if (should_free)
-		heap_freetuple(tuple);
-
-	ts_bgw_job_permission_check(updated_job);
-
-	/* when we update the schedule interval, modify the next start time as well*/
-	if (!DatumGetBool(DirectFunctionCall2(interval_eq,
-										  IntervalPGetDatum(&fd->schedule_interval),
-										  IntervalPGetDatum(&updated_job->fd.schedule_interval))))
-	{
-		BgwJobStat *stat = ts_bgw_job_stat_find(fd->id);
-
-		if (stat != NULL)
-		{
-			next_start = DatumGetTimestampTz(
-				DirectFunctionCall2(timestamptz_pl_interval,
-									TimestampTzGetDatum(stat->fd.last_finish),
-									IntervalPGetDatum(&updated_job->fd.schedule_interval)));
-			/* allow DT_NOBEGIN for next_start here through allow_unset=true in the case that
-			 * last_finish is DT_NOBEGIN,
-			 * This means the value is counted as unset which is what we want */
-			ts_bgw_job_stat_update_next_start(updated_job->fd.id, next_start, true);
-		}
-		fd->schedule_interval = updated_job->fd.schedule_interval;
-	}
-	fd->max_runtime = updated_job->fd.max_runtime;
-	fd->max_retries = updated_job->fd.max_retries;
-	fd->retry_period = updated_job->fd.retry_period;
-
-	ts_catalog_update(ti->scanrel, new_tuple);
-	heap_freetuple(new_tuple);
-
-	return SCAN_DONE;
-}
-
-static bool
-bgw_job_update_scan(ScanKeyData *scankey, void *data)
-{
-	Catalog *catalog = ts_catalog_get();
-	ScanTupLock scantuplock = {
-		.waitpolicy = LockWaitBlock,
-		.lockmode = LockTupleExclusive,
-	};
-	ScannerCtx scanctx = { .table = catalog_get_table_id(catalog, BGW_JOB),
-						   .index = catalog_get_index(catalog, BGW_JOB, BGW_JOB_PKEY_IDX),
-						   .nkeys = 1,
-						   .scankey = scankey,
-						   .data = data,
-						   .limit = 1,
-						   .tuple_found = bgw_job_tuple_update_by_id,
-						   .lockmode = RowExclusiveLock,
-						   .scandirection = ForwardScanDirection,
-						   .result_mctx = CurrentMemoryContext,
-						   .tuplock = &scantuplock };
-
-	return ts_scanner_scan(&scanctx);
-}
-
-/* Overwrite job with specified job_id with the given fields */
-void
-ts_bgw_job_update_by_id(int32 job_id, BgwJob *job)
-{
-	ScanKeyData scankey[1];
-
-	ScanKeyInit(&scankey[0],
-				Anum_bgw_job_pkey_idx_id,
-				BTEqualStrategyNumber,
-				F_INT4EQ,
-				Int32GetDatum(job_id));
-
-	bgw_job_update_scan(scankey, (void *) job);
 }

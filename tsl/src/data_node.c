@@ -32,6 +32,8 @@
 #include <utils/inval.h>
 #include <utils/syscache.h>
 
+#include "config.h"
+#include "extension.h"
 #include "fdw/fdw.h"
 #include "remote/async.h"
 #include "remote/connection.h"
@@ -60,7 +62,10 @@ typedef struct DbInfo
 	NameData collation;
 } DbInfo;
 
-static void data_node_validate_database(TSConnection *conn, const DbInfo *database);
+/* A list of databases we try to connect to when bootstrapping a data node */
+static const char *bootstrap_databases[] = { "postgres", "template1", "defaultdb" };
+
+static bool data_node_validate_database(TSConnection *conn, const DbInfo *database);
 
 /*
  * get_database_info - given a database OID, look up info about the database
@@ -137,7 +142,7 @@ data_node_get_foreign_server(const char *node_name, AclMode mode, bool fail_on_a
 	if (node_name == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid node_name: cannot be NULL")));
+				 errmsg("data node name cannot be NULL")));
 
 	server = GetForeignServerByName(node_name, missing_ok);
 	if (NULL == server)
@@ -167,7 +172,7 @@ data_node_get_foreign_server_by_oid(Oid server_oid, AclMode mode)
  */
 static bool
 create_foreign_server(const char *const node_name, const char *const host, int32 port,
-					  const char *const dbname, bool if_not_exists, Oid *const oid)
+					  const char *const dbname, bool if_not_exists)
 {
 	ForeignServer *server = NULL;
 	ObjectAddress objaddr;
@@ -197,9 +202,6 @@ create_foreign_server(const char *const node_name, const char *const host, int32
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("data node \"%s\" already exists, skipping", node_name)));
-
-			if (oid != NULL)
-				*oid = server->serverid;
 			return false;
 		}
 	}
@@ -211,16 +213,8 @@ create_foreign_server(const char *const node_name, const char *const host, int32
 	if (!OidIsValid(objaddr.objectId))
 	{
 		Assert(if_not_exists);
-
-		server = data_node_get_foreign_server(node_name, ACL_USAGE, true, false);
-
-		if (oid != NULL)
-			*oid = server->serverid;
 		return false;
 	}
-
-	if (oid != NULL)
-		*oid = objaddr.objectId;
 
 	return true;
 }
@@ -316,60 +310,69 @@ create_hypertable_data_node_datum(FunctionCallInfo fcinfo, HypertableDataNode *n
 }
 
 static List *
-create_data_node_options(const char *host, int32 port, const char *dbname, const char *user)
+create_data_node_options(const char *host, int32 port, const char *dbname, const char *user,
+						 const char *password)
 {
 	DefElem *host_elm = makeDefElem("host", (Node *) makeString(pstrdup(host)), -1);
 	DefElem *port_elm = makeDefElem("port", (Node *) makeInteger(port), -1);
 	DefElem *dbname_elm = makeDefElem("dbname", (Node *) makeString(pstrdup(dbname)), -1);
 	DefElem *user_elm = makeDefElem("user", (Node *) makeString(pstrdup(user)), -1);
 
+	if (NULL != password)
+	{
+		DefElem *password_elm = makeDefElem("password", (Node *) makeString(pstrdup(password)), -1);
+		return list_make5(host_elm, port_elm, dbname_elm, user_elm, password_elm);
+	}
+
 	return list_make4(host_elm, port_elm, dbname_elm, user_elm);
 }
 
+/* Returns 'true' if the database was created. */
 static bool
 data_node_bootstrap_database(TSConnection *conn, const DbInfo *database)
 {
 	const char *const username = PQuser(remote_connection_get_pg_conn(conn));
 
-	PGresult *res;
-
 	Assert(database);
 
-	/* Create the database with the user as owner. This command might fail
-	 * if the database already exists, but we catch the error and continue
-	 * with the bootstrapping if it does. */
-	res = remote_connection_execf(conn,
-								  "CREATE DATABASE %s ENCODING %s LC_COLLATE %s LC_CTYPE %s "
-								  "TEMPLATE template0 OWNER %s",
-								  quote_identifier(NameStr(database->name)),
-								  quote_identifier(pg_encoding_to_char(database->encoding)),
-								  quote_literal_cstr(NameStr(database->collation)),
-								  quote_literal_cstr(NameStr(database->chartype)),
-								  quote_identifier(username));
-
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (data_node_validate_database(conn, database))
 	{
-		const char *const sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-		bool database_exists = (sqlstate && strcmp(sqlstate, ERRCODE_DUPLICATE_DATABASE_STR) == 0);
-
-		if (!database_exists)
-			remote_result_elog(res, ERROR);
-
-		/* If the database already existed on the remote node, we got a
-		 * duplicate database error above and the database was not created.
-		 *
-		 * In this case, we will log a notice and proceed since it is not an
-		 * error if the database already existed on the remote node. */
+		/* If the database already existed on the remote node, we will log a
+		 * notice and proceed since it is not an error if the database already
+		 * existed on the remote node. */
 		elog(NOTICE,
 			 "database \"%s\" already exists on data node, skipping",
 			 NameStr(database->name));
-		data_node_validate_database(conn, database);
+		return false;
 	}
 
-	return (PQresultStatus(res) == PGRES_COMMAND_OK);
+	/* Create the database with the user as owner. There is no need to
+	 * validate the database after this command since it should be created
+	 * correctly. */
+	PGresult *res =
+		remote_connection_execf(conn,
+								"CREATE DATABASE %s ENCODING %s LC_COLLATE %s LC_CTYPE %s "
+								"TEMPLATE template0 OWNER %s",
+								quote_identifier(NameStr(database->name)),
+								quote_identifier(pg_encoding_to_char(database->encoding)),
+								quote_literal_cstr(NameStr(database->collation)),
+								quote_literal_cstr(NameStr(database->chartype)),
+								quote_identifier(username));
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		remote_result_elog(res, ERROR);
+	return true;
 }
 
-static void
+/* Validate the database.
+ *
+ * Errors:
+ *   Will abort with errors if the database exists but is not correctly set
+ *   up.
+ * Returns:
+ *   true if the database exists and is valid
+ *   false if it does not exist.
+ */
+static bool
 data_node_validate_database(TSConnection *conn, const DbInfo *database)
 {
 	PGresult *res;
@@ -386,16 +389,17 @@ data_node_validate_database(TSConnection *conn, const DbInfo *database)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("%s", PQresultErrorMessage(res))));
 
-	/* This only fails if current database is not in pg_database, which would
-	 * very very strange. */
-	Assert(PQntuples(res) > 0 && PQnfields(res) > 2);
+	if (PQntuples(res) == 0)
+		return false;
+
+	Assert(PQnfields(res) > 2);
 
 	actual_encoding = atoi(PQgetvalue(res, 0, 0));
 	if (actual_encoding != database->encoding)
 		ereport(ERROR,
 				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
-				 errmsg("database encoding mismatch"),
-				 errdetail("Expected database encoding to be \"%s\" (%u) but it was \"%s\" (%u)",
+				 errmsg("database exists but has wrong encoding"),
+				 errdetail("Expected database encoding to be \"%s\" (%u) but it was \"%s\" (%u).",
 						   pg_encoding_to_char(database->encoding),
 						   database->encoding,
 						   pg_encoding_to_char(actual_encoding),
@@ -406,8 +410,8 @@ data_node_validate_database(TSConnection *conn, const DbInfo *database)
 	if (strcmp(actual_collation, NameStr(database->collation)) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
-				 errmsg("database collation mismatch"),
-				 errdetail("Expected collation \"%s\" but it was \"%s\"",
+				 errmsg("database exists but has wrong collation"),
+				 errdetail("Expected collation \"%s\" but it was \"%s\".",
 						   NameStr(database->collation),
 						   actual_collation)));
 
@@ -416,10 +420,11 @@ data_node_validate_database(TSConnection *conn, const DbInfo *database)
 	if (strcmp(actual_chartype, NameStr(database->chartype)) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
-				 errmsg("database LC_CTYPE mismatch"),
-				 errdetail("Expected LC_CTYPE \"%s\" but it was \"%s\"",
+				 errmsg("database exists but has wrong LC_CTYPE"),
+				 errdetail("Expected LC_CTYPE \"%s\" but it was \"%s\".",
 						   NameStr(database->chartype),
 						   actual_chartype)));
+	return true;
 }
 
 static void
@@ -427,12 +432,9 @@ data_node_validate_extension(TSConnection *conn)
 {
 	const char *const dbname = PQdb(remote_connection_get_pg_conn(conn));
 	const char *const host = PQhost(remote_connection_get_pg_conn(conn));
-	const char *const username = PQuser(remote_connection_get_pg_conn(conn));
 	const char *const port = PQport(remote_connection_get_pg_conn(conn));
 
-	const char *actual_username = NULL;
-
-	if (!remote_connection_check_extension(conn, &actual_username, NULL))
+	if (!remote_connection_check_extension(conn))
 		ereport(ERROR,
 				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
 				 errmsg("database does not have TimescaleDB extension loaded"),
@@ -441,15 +443,6 @@ data_node_validate_extension(TSConnection *conn)
 						   dbname,
 						   host,
 						   port)));
-
-	/* Check that the owner is correct */
-	if (strcmp(actual_username, username) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
-				 errmsg("invalid extension owner"),
-				 errdetail("Expected TimescaleDB owner to be %s, but was %s",
-						   username,
-						   actual_username)));
 }
 
 static void
@@ -461,7 +454,7 @@ data_node_validate_as_data_node(TSConnection *conn)
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		ereport(ERROR,
 				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
-				 (errmsg("%s is not valid as data node", remote_connection_node_name(conn)),
+				 (errmsg("cannot add \"%s\" as a data node", remote_connection_node_name(conn)),
 				  errdetail("%s", PQresultErrorMessage(res)))));
 
 	remote_result_close(res);
@@ -511,14 +504,16 @@ data_node_bootstrap_extension(TSConnection *conn)
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_SCHEMA),
 						 errmsg("schema \"%s\" already exists in database, aborting", schema_name),
-						 errhint("Please make sure that the data node does not contain any "
+						 errhint("Make sure that the data node does not contain any "
 								 "existing objects prior to adding it.")));
 			}
 		}
 
 		remote_connection_cmdf_ok(conn,
-								  "CREATE EXTENSION " EXTENSION_NAME " WITH SCHEMA %s CASCADE",
-								  schema_name_quoted);
+								  "CREATE EXTENSION " EXTENSION_NAME
+								  " WITH SCHEMA %s VERSION %s CASCADE",
+								  schema_name_quoted,
+								  quote_literal_cstr(ts_extension_get_version()));
 		return true;
 	}
 	else
@@ -552,40 +547,61 @@ add_distributed_id_to_data_node(TSConnection *conn)
 /*
  * Connect to do bootstrapping.
  *
- * This behaves similar to connectMaintenanceDatabase and will first try to
- * connect to "postgres" database and if that does not exists, to the
- * "template1" database.
+ * We iterate through the list of databases and try to connect to so we can
+ * bootstrap the data node.
  */
 static TSConnection *
 connect_for_bootstrapping(const char *node_name, const char *const host, int32 port,
-						  const char *username)
+						  const char *username, const char *password)
 {
-	List *node_options = create_data_node_options(host, port, "postgres", username);
-	TSConnection *conn = remote_connection_open_with_options_nothrow(node_name, node_options);
+	TSConnection *conn = NULL;
+	char *err = NULL;
+	int i;
 
-	if (conn)
-		return conn;
+	for (i = 0; i < lengthof(bootstrap_databases); i++)
+	{
+		List *node_options =
+			create_data_node_options(host, port, bootstrap_databases[i], username, password);
+		conn = remote_connection_open_with_options_nothrow(node_name, node_options, &err);
 
-	node_options = create_data_node_options(host, port, "template1", username);
-	return remote_connection_open_with_options_nothrow(node_name, node_options);
+		if (conn)
+			return conn;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
+			 errmsg("could not connect to \"%s\"", node_name),
+			 err == NULL ? 0 : errdetail("%s", err)));
+
+	pg_unreachable();
+
+	return NULL;
 }
 
-/**
- * Validate that extension is available and with the correct version.
+/*
+ * Validate that compatible extension is available on the data node.
  *
- * If the extension is not available on the data node, we will get strange
- * errors when we try to use functions, so we check that the extension is
- * available before attempting anything else.
+ * We check all available extension versions. Since we are connected to
+ * template DB when performing this check, it means we can't
+ * really tell if a compatible extension is installed in the database we
+ * are trying to add to the cluster. However we can make sure that a user
+ * will be able to manually upgrade the extension on the data node if needed.
  *
- * Will abort with error if there is an issue, otherwise do nothing.
+ * Will abort with error if there is no compatible version available, otherwise do nothing.
  */
 static void
 data_node_validate_extension_availability(TSConnection *conn)
 {
-	PGresult *res = remote_connection_execf(conn,
-											"SELECT default_version, installed_version FROM "
-											"pg_available_extensions WHERE name = %s",
-											quote_literal_cstr(EXTENSION_NAME));
+	StringInfo concat_versions = makeStringInfo();
+	bool compatible = false;
+	PGresult *res;
+	int i;
+
+	res =
+		remote_connection_execf(conn,
+								"SELECT version FROM pg_available_extension_versions WHERE name = "
+								"%s AND version ~ '\\d+.\\d+.\\d+.*' ORDER BY version DESC",
+								quote_literal_cstr(EXTENSION_NAME));
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		ereport(ERROR,
@@ -597,8 +613,28 @@ data_node_validate_extension_availability(TSConnection *conn)
 				 errmsg("TimescaleDB extension not available on remote PostgreSQL instance"),
 				 errhint("Install the TimescaleDB extension on the remote PostgresSQL instance.")));
 
-	/* Here we validate the available version, not the installed version */
-	remote_validate_extension_version(conn, PQgetvalue(res, 0, 0));
+	Assert(PQnfields(res) == 1);
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		bool old_version = false;
+
+		appendStringInfo(concat_versions, "%s, ", PQgetvalue(res, i, 0));
+		compatible = dist_util_is_compatible_version(PQgetvalue(res, i, 0),
+													 TIMESCALEDB_VERSION,
+													 &old_version);
+		if (compatible)
+			break;
+	}
+
+	if (!compatible)
+		ereport(ERROR,
+				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
+				 errmsg("remote PostgreSQL instance has an incompatible timescaledb extension "
+						"version"),
+				 errdetail_internal("Access node version: %s, available remote versions: %s.",
+									TIMESCALEDB_VERSION_MOD,
+									concat_versions->data)));
 }
 
 /**
@@ -636,13 +672,14 @@ data_node_add_internal(PG_FUNCTION_ARGS, bool set_distid)
 	int32 port = PG_ARGISNULL(3) ? get_server_port() : PG_GETARG_INT32(3);
 	bool if_not_exists = PG_ARGISNULL(4) ? false : PG_GETARG_BOOL(4);
 	bool bootstrap = PG_ARGISNULL(5) ? true : PG_GETARG_BOOL(5);
+	const char *password = PG_ARGISNULL(6) ? NULL : TextDatumGetCString(PG_GETARG_DATUM(6));
 	bool server_created = false;
 	bool database_created = false;
 	bool extension_created = false;
 	bool PG_USED_FOR_ASSERTS_ONLY result;
 	DbInfo database;
 
-	PreventCommandIfReadOnly("add_data_node()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	namestrcpy(&database.name, dbname);
 
@@ -659,13 +696,14 @@ data_node_add_internal(PG_FUNCTION_ARGS, bool set_distid)
 
 	if (NULL == node_name)
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), (errmsg("invalid data node name"))));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 (errmsg("data node name cannot be NULL"))));
 
 	if (port < 1 || port > PG_UINT16_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 (errmsg("invalid port number %d", port),
-				  errhint("The port number must be between 1 and %u", PG_UINT16_MAX))));
+				  errhint("The port number must be between 1 and %u.", PG_UINT16_MAX))));
 
 	result = get_database_info(MyDatabaseId, &database);
 	Assert(result);
@@ -678,8 +716,8 @@ data_node_add_internal(PG_FUNCTION_ARGS, bool set_distid)
 	PreventInTransactionBlock(true, "add_data_node");
 
 	/* Try to create the foreign server, or get the existing one in case of
-	 * if_not_exists = true. */
-	if (create_foreign_server(node_name, host, port, dbname, if_not_exists, NULL))
+	 * if_not_exists true. */
+	if (create_foreign_server(node_name, host, port, dbname, if_not_exists))
 	{
 		List *node_options;
 		TSConnection *conn;
@@ -700,7 +738,9 @@ data_node_add_internal(PG_FUNCTION_ARGS, bool set_distid)
 		 * connect to it. */
 		if (bootstrap)
 		{
-			TSConnection *conn = connect_for_bootstrapping(node_name, host, port, username);
+			TSConnection *conn =
+				connect_for_bootstrapping(node_name, host, port, username, password);
+			Assert(NULL != conn);
 			data_node_validate_extension_availability(conn);
 			database_created = data_node_bootstrap_database(conn, &database);
 			remote_connection_close(conn);
@@ -715,18 +755,22 @@ data_node_add_internal(PG_FUNCTION_ARGS, bool set_distid)
 		 * comparably heavy and make the code more complicated than
 		 * necessary. Instead using a more straightforward approach here since
 		 * we do not need 2PC support. */
-		node_options = create_data_node_options(host, port, dbname, username);
+		node_options = create_data_node_options(host, port, dbname, username, password);
 		conn = remote_connection_open_with_options(node_name, node_options, false);
+		Assert(NULL != conn);
 		remote_connection_cmd_ok(conn, "BEGIN");
 
 		if (bootstrap)
 			extension_created = data_node_bootstrap_extension(conn);
-		else
+
+		if (!database_created)
 		{
 			data_node_validate_database(conn, &database);
-			data_node_validate_extension(conn);
 			data_node_validate_as_data_node(conn);
 		}
+
+		if (!extension_created)
+			data_node_validate_extension(conn);
 
 		/* After the node is verified or bootstrapped, we set the `dist_uuid`
 		 * using the same connection. We skip this if clustering checks are
@@ -787,12 +831,11 @@ data_node_attach(PG_FUNCTION_ARGS)
 	int num_nodes;
 	ListCell *lc;
 
-	PreventCommandIfReadOnly("attach_data_node()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	if (PG_ARGISNULL(1))
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid hypertable: cannot be NULL")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("hypertable cannot be NULL")));
 	Assert(get_rel_name(table_id));
 
 	ht = ts_hypertable_cache_get_cache_and_entry(table_id, CACHE_FLAG_NONE, &hcache);
@@ -850,7 +893,7 @@ data_node_attach(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("max number of data nodes already attached"),
-				 errdetail("The number of data nodes in a hypertable cannot exceed %d",
+				 errdetail("The number of data nodes in a hypertable cannot exceed %d.",
 						   MAX_NUM_HYPERTABLE_DATA_NODES)));
 
 	/* If there are less slices (partitions) in the space dimension than there
@@ -898,50 +941,23 @@ typedef enum OperationType
 	OP_DELETE
 } OperationType;
 
-static char *
-get_operation_type_message(OperationType op_type)
-{
-	switch (op_type)
-	{
-		case OP_BLOCK:
-			return "blocking new chunks on";
-		case OP_DETACH:
-			return "detaching";
-		case OP_DELETE:
-			return "deleting";
-		default:
-			return NULL;
-	}
-}
-
 static void
 check_replication_for_new_data(const char *node_name, Hypertable *ht, bool force,
 							   OperationType op_type)
 {
 	List *available_nodes = ts_hypertable_get_available_data_nodes(ht, false);
-	char *operation = get_operation_type_message(op_type);
 
 	if (ht->fd.replication_factor < list_length(available_nodes))
 		return;
 
-	if (!force)
-		ereport(ERROR,
-				(errcode(ERRCODE_TS_INTERNAL_ERROR),
-				 errmsg("%s data node \"%s\" risks making new data for hypertable \"%s\" "
-						"under-replicated",
-						operation,
-						node_name,
-						NameStr(ht->fd.table_name)),
-				 errhint("Call function with force => true to force this operation.")));
-
-	ereport(WARNING,
-			(errcode(ERRCODE_TS_INTERNAL_ERROR),
-			 errmsg("new data for hypertable \"%s\" will be under-replicated due to %s data "
-					"node "
-					"\"%s\"",
-					NameStr(ht->fd.table_name),
-					operation,
-					node_name)));
+	ereport(force ? WARNING : ERROR,
+			(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
+			 errmsg("insufficient number of data nodes for distributed hypertable \"%s\"",
+					NameStr(ht->fd.table_name)),
+			 errdetail("Reducing the number of available data nodes on distributed"
+					   " hypertable \"%s\" prevents full replication of new chunks.",
+					   NameStr(ht->fd.table_name)),
+			 force ? 0 : errhint("Use force => true to force this operation.")));
 }
 
 static bool
@@ -963,43 +979,44 @@ data_node_contains_non_replicated_chunks(List *chunk_data_nodes)
 }
 
 static List *
-data_node_detach_validate(const char *node_name, Hypertable *ht, bool force, OperationType op_type)
+data_node_detach_or_delete_validate(const char *node_name, Hypertable *ht, bool force,
+									OperationType op_type)
 {
 	List *chunk_data_nodes =
 		ts_chunk_data_node_scan_by_node_name_and_hypertable_id(node_name,
 															   ht->fd.id,
 															   CurrentMemoryContext);
 	bool has_non_replicated_chunks = data_node_contains_non_replicated_chunks(chunk_data_nodes);
-	char *operation = get_operation_type_message(op_type);
+
+	Assert(op_type == OP_DELETE || op_type == OP_DETACH);
 
 	if (has_non_replicated_chunks)
 		ereport(ERROR,
-				(errcode(ERRCODE_TS_INTERNAL_ERROR),
-				 errmsg("%s data node \"%s\" would mean a data-loss for hypertable "
-						"\"%s\" since data node has the only data replica",
-						operation,
-						node_name,
-						NameStr(ht->fd.table_name)),
-				 errhint("Ensure the data node \"%s\" has no non-replicated data before %s it.",
-						 node_name,
-						 operation)));
+				(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
+				 errmsg("insufficient number of data nodes"),
+				 errdetail("Distributed hypertable \"%s\" would lose data if"
+						   " data node \"%s\" is %s.",
+						   NameStr(ht->fd.table_name),
+						   node_name,
+						   (op_type == OP_DELETE) ? "deleted" : "detached"),
+				 errhint("Ensure all chunks on the data node are fully replicated before %s it.",
+						 (op_type == OP_DELETE) ? "deleting" : "detaching")));
 
 	if (list_length(chunk_data_nodes) > 0)
 	{
 		if (force)
 			ereport(WARNING,
-					(errcode(ERRCODE_WARNING),
-					 errmsg("hypertable \"%s\" has under-replicated chunks due to %s "
-							"data node \"%s\"",
-							NameStr(ht->fd.table_name),
-							operation,
-							node_name)));
+					(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
+					 errmsg("distributed hypertable \"%s\" is under-replicated",
+							NameStr(ht->fd.table_name)),
+					 errdetail("Some chunks no longer meet the replication target"
+							   " after %s data node \"%s\".",
+							   (op_type == OP_DELETE) ? "deleting" : "detaching",
+							   node_name)));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_TS_DATA_NODE_IN_USE),
-					 errmsg("%s data node \"%s\" failed because it contains chunks "
-							"for hypertable \"%s\"",
-							operation,
+					 errmsg("data node \"%s\" still holds data for distributed hypertable \"%s\"",
 							node_name,
 							NameStr(ht->fd.table_name))));
 	}
@@ -1049,7 +1066,10 @@ data_node_modify_hypertable_data_nodes(const char *node_name, List *hypertable_d
 		{
 			/* we have permissions to detach */
 			List *chunk_data_nodes =
-				data_node_detach_validate(NameStr(node->fd.node_name), ht, force, op_type);
+				data_node_detach_or_delete_validate(NameStr(node->fd.node_name),
+													ht,
+													force,
+													op_type);
 			ListCell *cs_lc;
 
 			/* update chunk foreign table server and delete chunk mapping */
@@ -1093,13 +1113,11 @@ data_node_modify_hypertable_data_nodes(const char *node_name, List *hypertable_d
 			{
 				if (node->fd.block_chunks)
 				{
-					ereport(NOTICE,
-							(errcode(ERRCODE_TS_INTERNAL_ERROR),
-							 errmsg("new chunks already blocked on data node \"%s\" for "
-									"hypertable "
-									"\"%s\"",
-									NameStr(node->fd.node_name),
-									get_rel_name(relid))));
+					elog(NOTICE,
+						 "new chunks already blocked on data node \"%s\" for"
+						 " hypertable \"%s\"",
+						 NameStr(node->fd.node_name),
+						 get_rel_name(relid));
 					continue;
 				}
 
@@ -1141,14 +1159,14 @@ data_node_detach_hypertable_data_nodes(const char *node_name, List *hypertable_d
 }
 
 static HypertableDataNode *
-get_hypertable_data_node(Oid table_id, const char *node_name, bool ownercheck)
+get_hypertable_data_node(Oid table_id, const char *node_name, bool owner_check, bool attach_check)
 {
 	HypertableDataNode *hdn = NULL;
 	Cache *hcache = ts_hypertable_cache_pin();
 	Hypertable *ht = ts_hypertable_cache_get_entry(hcache, table_id, CACHE_FLAG_NONE);
 	ListCell *lc;
 
-	if (ownercheck)
+	if (owner_check)
 		ts_hypertable_permissions_check(table_id, GetUserId());
 
 	foreach (lc, ht->data_nodes)
@@ -1161,11 +1179,21 @@ get_hypertable_data_node(Oid table_id, const char *node_name, bool ownercheck)
 	}
 
 	if (hdn == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_TS_DATA_NODE_NOT_ATTACHED),
-				 errmsg("data node \"%s\" is not attached to hypertable \"%s\"",
-						node_name,
-						get_rel_name(table_id))));
+	{
+		if (attach_check)
+			ereport(ERROR,
+					(errcode(ERRCODE_TS_DATA_NODE_NOT_ATTACHED),
+					 errmsg("data node \"%s\" is not attached to hypertable \"%s\"",
+							node_name,
+							get_rel_name(table_id))));
+		else
+			ereport(NOTICE,
+					(errcode(ERRCODE_TS_DATA_NODE_NOT_ATTACHED),
+					 errmsg("data node \"%s\" is not attached to hypertable \"%s\", "
+							"skipping",
+							node_name,
+							get_rel_name(table_id))));
+	}
 
 	ts_cache_release(hcache);
 
@@ -1188,7 +1216,7 @@ data_node_block_or_allow_new_chunks(const char *node_name, Oid const table_id, b
 		/* Early abort on missing hypertable permissions */
 		ts_hypertable_permissions_check(table_id, GetUserId());
 		hypertable_data_nodes =
-			list_make1(get_hypertable_data_node(table_id, server->servername, true));
+			list_make1(get_hypertable_data_node(table_id, server->servername, true, true));
 	}
 	else
 	{
@@ -1211,7 +1239,7 @@ data_node_allow_new_chunks(PG_FUNCTION_ARGS)
 	const char *node_name = PG_ARGISNULL(0) ? NULL : NameStr(*PG_GETARG_NAME(0));
 	Oid table_id = PG_ARGISNULL(1) ? InvalidOid : PG_GETARG_OID(1);
 
-	PreventCommandIfReadOnly("allow_new_chunks()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	return data_node_block_or_allow_new_chunks(node_name, table_id, false, false);
 }
@@ -1223,7 +1251,7 @@ data_node_block_new_chunks(PG_FUNCTION_ARGS)
 	Oid table_id = PG_ARGISNULL(1) ? InvalidOid : PG_GETARG_OID(1);
 	bool force = PG_ARGISNULL(2) ? false : PG_GETARG_BOOL(2);
 
-	PreventCommandIfReadOnly("block_new_chunks()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	return data_node_block_or_allow_new_chunks(node_name, table_id, force, true);
 }
@@ -1234,23 +1262,28 @@ data_node_detach(PG_FUNCTION_ARGS)
 	const char *node_name = PG_ARGISNULL(0) ? NULL : NameStr(*PG_GETARG_NAME(0));
 	Oid table_id = PG_ARGISNULL(1) ? InvalidOid : PG_GETARG_OID(1);
 	bool all_hypertables = PG_ARGISNULL(1);
-	bool force = PG_ARGISNULL(2) ? InvalidOid : PG_GETARG_OID(2);
-	bool repartition = PG_ARGISNULL(3) ? false : PG_GETARG_BOOL(3);
+	bool if_attached = PG_ARGISNULL(2) ? false : PG_GETARG_BOOL(2);
+	bool force = PG_ARGISNULL(3) ? InvalidOid : PG_GETARG_OID(3);
+	bool repartition = PG_ARGISNULL(4) ? false : PG_GETARG_BOOL(4);
 	int removed = 0;
 	List *hypertable_data_nodes = NIL;
 	ForeignServer *server;
 
-	PreventCommandIfReadOnly("detach_data_node()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	server = data_node_get_foreign_server(node_name, ACL_USAGE, true, false);
 	Assert(NULL != server);
 
 	if (OidIsValid(table_id))
 	{
+		HypertableDataNode *node;
+
 		/* Early abort on missing hypertable permissions */
 		ts_hypertable_permissions_check(table_id, GetUserId());
-		hypertable_data_nodes =
-			list_make1(get_hypertable_data_node(table_id, server->servername, true));
+
+		node = get_hypertable_data_node(table_id, server->servername, true, !if_attached);
+		if (node)
+			hypertable_data_nodes = list_make1(node);
 	}
 	else
 	{
@@ -1290,7 +1323,7 @@ data_node_delete(PG_FUNCTION_ARGS)
 	TSConnectionId cid;
 	ForeignServer *server;
 
-	PreventCommandIfReadOnly("delete_data_node()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	/* Need USAGE to detach. Further owner check done when executing the DROP
 	 * statement. */

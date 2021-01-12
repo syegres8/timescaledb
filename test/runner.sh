@@ -15,7 +15,11 @@ TEST_SUPPORT_FILE=${CURRENT_DIR}/sql/utils/testsupport.sql
 # PGAPPNAME will be 'pg_regress/test' so we cut off the prefix
 # to get the name of the test
 CURRENT_TEST=${PGAPPNAME##pg_regress/}
-TEST_DBNAME="db_${CURRENT_TEST}"
+
+# Since PG11 and PG12 tests do not run in parallel, we remove the
+# trailing "-11" (or "-12") suffix to get a good symbol that can be
+# used as identifier as well.
+TEST_DBNAME="db_${CURRENT_TEST%%-[0-9][0-9]}"
 
 # Read the extension version from version.config
 read -r VERSION < ${CURRENT_DIR}/../version.config
@@ -34,6 +38,7 @@ TEST_ROLE_DEFAULT_PERM_USER_2=${TEST_ROLE_DEFAULT_PERM_USER_2:-default_perm_user
 TEST_ROLE_CLUSTER_SUPERUSER=${TEST_ROLE_CLUSTER_SUPERUSER:-cluster_superuser}
 TEST_ROLE_1=${TEST_ROLE_1:-test_role_1}
 TEST_ROLE_2=${TEST_ROLE_2:-test_role_2}
+TEST_ROLE_2_PASS=${TEST_ROLE_2_PASS:-pass}
 TEST_ROLE_3=${TEST_ROLE_3:-test_role_3}
 TEST_ROLE_3_PASS=${TEST_ROLE_3_PASS:-pass}
 
@@ -59,7 +64,7 @@ if mkdir ${TEST_OUTPUT_DIR}/.pg_init 2>/dev/null; then
     ALTER USER ${TEST_ROLE_SUPERUSER} WITH SUPERUSER;
     ALTER USER ${TEST_ROLE_CLUSTER_SUPERUSER} WITH SUPERUSER;
     ALTER USER ${TEST_ROLE_1} WITH CREATEDB CREATEROLE;
-    ALTER USER ${TEST_ROLE_2} WITH CREATEDB;
+    ALTER USER ${TEST_ROLE_2} WITH CREATEDB PASSWORD '${TEST_ROLE_2_PASS}';
     ALTER USER ${TEST_ROLE_3} WITH CREATEDB PASSWORD '${TEST_ROLE_3_PASS}';
 EOF
   ${PSQL} $@ -U ${USER} -d postgres -v ECHO=none -c "ALTER USER ${TEST_ROLE_SUPERUSER} WITH SUPERUSER;" >/dev/null
@@ -85,6 +90,9 @@ ${PSQL} -U ${TEST_PGUSER} \
      -v VERBOSITY=terse \
      -v ECHO=all \
      -v TEST_DBNAME="${TEST_DBNAME}" \
+     -v TEST_TABLESPACE1_PREFIX=${TEST_TABLESPACE1_PREFIX} \
+     -v TEST_TABLESPACE2_PREFIX=${TEST_TABLESPACE2_PREFIX} \
+     -v TEST_TABLESPACE3_PREFIX=${TEST_TABLESPACE3_PREFIX} \
      -v TEST_TABLESPACE1_PATH=\'${TEST_TABLESPACE1_PATH}\' \
      -v TEST_TABLESPACE2_PATH=\'${TEST_TABLESPACE2_PATH}\' \
      -v TEST_TABLESPACE3_PATH=\'${TEST_TABLESPACE3_PATH}\' \
@@ -98,6 +106,7 @@ ${PSQL} -U ${TEST_PGUSER} \
      -v ROLE_1=${TEST_ROLE_1} \
      -v ROLE_2=${TEST_ROLE_2} \
      -v ROLE_3=${TEST_ROLE_3} \
+     -v ROLE_2_PASS=${TEST_ROLE_2_PASS} \
      -v ROLE_3_PASS=${TEST_ROLE_3_PASS} \
      -v MODULE_PATHNAME="'timescaledb-${EXT_VERSION}'" \
      -v TSL_MODULE_PATHNAME="'timescaledb-tsl-${EXT_VERSION}'" \

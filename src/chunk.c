@@ -29,6 +29,7 @@
 #include <fmgr.h>
 #include <utils/datum.h>
 #include <catalog/pg_type.h>
+#include <utils/acl.h>
 #include <utils/timestamp.h>
 #include <nodes/execnodes.h>
 #include <executor/executor.h>
@@ -113,7 +114,7 @@ static int chunk_scan_ctx_foreach_chunk_stub(ChunkScanCtx *ctx, on_chunk_stub_fu
 											 uint16 limit);
 static Datum chunks_return_srf(FunctionCallInfo fcinfo);
 static int chunk_cmp(const void *ch1, const void *ch2);
-static Chunk *chunk_find(Hypertable *ht, Point *p, bool resurrect);
+static Chunk *chunk_find(Hypertable *ht, Point *p, bool resurrect, bool lock_slices);
 static void init_scan_by_qualified_table_name(ScanIterator *iterator, const char *schema_name,
 											  const char *table_name);
 static Hypertable *find_hypertable_from_table_or_cagg(Cache *hcache, Oid relid);
@@ -194,6 +195,17 @@ chunk_formdata_fill(FormData_chunk *fd, const TupleInfo *ti)
 
 	if (should_free)
 		heap_freetuple(tuple);
+}
+int64
+ts_chunk_primary_dimension_start(const Chunk *chunk)
+{
+	return chunk->cube->slices[0]->fd.range_start;
+}
+
+int64
+ts_chunk_primary_dimension_end(const Chunk *chunk)
+{
+	return chunk->cube->slices[0]->fd.range_end;
 }
 
 static void
@@ -811,7 +823,7 @@ ts_chunk_create_table(Chunk *chunk, Hypertable *ht, const char *tablespacename)
 
 		if (list_length(chunk->data_nodes) == 0)
 			ereport(ERROR,
-					(errcode(ERRCODE_TS_NO_DATA_NODES),
+					(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
 					 (errmsg("no data nodes associated with chunk \"%s\"",
 							 get_rel_name(chunk->table_id)))));
 
@@ -861,7 +873,7 @@ chunk_assign_data_nodes(Chunk *chunk, Hypertable *ht)
 
 	if (ht->data_nodes == NIL)
 		ereport(ERROR,
-				(errcode(ERRCODE_TS_NO_DATA_NODES),
+				(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
 				 (errmsg("no data nodes associated with hypertable \"%s\"",
 						 get_rel_name(ht->main_table_relid)))));
 
@@ -1069,33 +1081,62 @@ ts_chunk_find_or_create_without_cuts(Hypertable *ht, Hypercube *hc, const char *
 	ChunkStub *stub;
 	Chunk *chunk = NULL;
 
-	LockRelationOid(ht->main_table_relid, ShareUpdateExclusiveLock);
+	DEBUG_WAITPOINT("find_or_create_chunk_start");
 
 	stub = chunk_collides(ht, hc);
 
 	if (NULL == stub)
 	{
-		chunk = chunk_create_from_hypercube_after_lock(ht, hc, schema_name, table_name, NULL);
+		/* Serialize chunk creation around the root hypertable */
+		LockRelationOid(ht->main_table_relid, ShareUpdateExclusiveLock);
 
-		if (NULL != created)
-			*created = true;
+		/* Check again after lock */
+		stub = chunk_collides(ht, hc);
+
+		if (NULL == stub)
+		{
+			ScanTupLock tuplock = {
+				.lockmode = LockTupleKeyShare,
+				.waitpolicy = LockWaitBlock,
+			};
+
+			/* Lock all slices that already exist to ensure they remain when we
+			 * commit since we won't create those slices ourselves. */
+			ts_hypercube_find_existing_slices(hc, &tuplock);
+
+			chunk = chunk_create_from_hypercube_after_lock(ht, hc, schema_name, table_name, NULL);
+
+			if (NULL != created)
+				*created = true;
+
+			ASSERT_IS_VALID_CHUNK(chunk);
+
+			DEBUG_WAITPOINT("find_or_create_chunk_created");
+
+			return chunk;
+		}
+
+		/* We didn't need the lock, so release it */
+		UnlockRelationOid(ht->main_table_relid, ShareUpdateExclusiveLock);
 	}
-	else
-	{
-		/* We can only use an existing chunk if it has identical dimensional
-		 * constraints. Otherwise, throw an error */
-		if (!ts_hypercube_equal(stub->cube, hc))
-			ereport(ERROR,
-					(errcode(ERRCODE_TS_CHUNK_COLLISION),
-					 errmsg("chunk creation failed due to collision")));
 
-		/* chunk_collides only returned a stub, so we need to lookup the full
-		 * chunk. */
-		chunk = ts_chunk_get_by_id(stub->id, true);
+	Assert(NULL != stub);
 
-		if (NULL != created)
-			*created = false;
-	}
+	/* We can only use an existing chunk if it has identical dimensional
+	 * constraints. Otherwise, throw an error */
+	if (!ts_hypercube_equal(stub->cube, hc))
+		ereport(ERROR,
+				(errcode(ERRCODE_TS_CHUNK_COLLISION),
+				 errmsg("chunk creation failed due to collision")));
+
+	/* chunk_collides only returned a stub, so we need to lookup the full
+	 * chunk. */
+	chunk = ts_chunk_get_by_id(stub->id, true);
+
+	if (NULL != created)
+		*created = false;
+
+	DEBUG_WAITPOINT("find_or_create_chunk_found");
 
 	ASSERT_IS_VALID_CHUNK(chunk);
 
@@ -1118,8 +1159,10 @@ ts_chunk_create_from_point(Hypertable *ht, Point *p, const char *schema, const c
 	 */
 	LockRelationOid(ht->main_table_relid, ShareUpdateExclusiveLock);
 
-	/* Recheck if someone else created the chunk before we got the table lock */
-	chunk = chunk_find(ht, p, true);
+	/* Recheck if someone else created the chunk before we got the table
+	 * lock. The returned chunk will have all slices locked so that they
+	 * aren't removed. */
+	chunk = chunk_find(ht, p, true, true);
 
 	if (NULL == chunk)
 	{
@@ -1130,6 +1173,11 @@ ts_chunk_create_from_point(Hypertable *ht, Point *p, const char *schema, const c
 					 errhint("chunk creation should only happen through an access node")));
 
 		chunk = chunk_create_from_point_after_lock(ht, p, schema, NULL, prefix);
+	}
+	else
+	{
+		/* Chunk was not created, so we can release the lock early */
+		UnlockRelationOid(ht->main_table_relid, ShareUpdateExclusiveLock);
 	}
 
 	ASSERT_IS_VALID_CHUNK(chunk);
@@ -1366,7 +1414,7 @@ dimension_slice_and_chunk_constraint_join(ChunkScanCtx *scanctx, DimensionVec *v
  * to two chunks.
  */
 static void
-chunk_point_scan(ChunkScanCtx *scanctx, Point *p)
+chunk_point_scan(ChunkScanCtx *scanctx, Point *p, bool lock_slices)
 {
 	int i;
 
@@ -1374,11 +1422,15 @@ chunk_point_scan(ChunkScanCtx *scanctx, Point *p)
 	for (i = 0; i < scanctx->space->num_dimensions; i++)
 	{
 		DimensionVec *vec;
+		ScanTupLock tuplock = {
+			.lockmode = LockTupleKeyShare,
+			.waitpolicy = LockWaitBlock,
+		};
 
 		vec = ts_dimension_slice_scan_limit(scanctx->space->dimensions[i].fd.id,
 											p->coordinates[i],
 											0,
-											NULL);
+											lock_slices ? &tuplock : NULL);
 
 		dimension_slice_and_chunk_constraint_join(scanctx, vec);
 	}
@@ -1610,7 +1662,7 @@ chunk_resurrect(Hypertable *ht, ChunkStub *stub)
  * case it needs to live beyond the lifetime of the other data.
  */
 static Chunk *
-chunk_find(Hypertable *ht, Point *p, bool resurrect)
+chunk_find(Hypertable *ht, Point *p, bool resurrect, bool lock_slices)
 {
 	ChunkStub *stub;
 	Chunk *chunk = NULL;
@@ -1623,7 +1675,7 @@ chunk_find(Hypertable *ht, Point *p, bool resurrect)
 	ctx.early_abort = true;
 
 	/* Scan for the chunk matching the point */
-	chunk_point_scan(&ctx, p);
+	chunk_point_scan(&ctx, p, lock_slices);
 
 	/* Find the stub that has N matching dimension constraints */
 	stub = chunk_scan_ctx_get_chunk_stub(&ctx);
@@ -1657,9 +1709,9 @@ chunk_find(Hypertable *ht, Point *p, bool resurrect)
 }
 
 Chunk *
-ts_chunk_find(Hypertable *ht, Point *p)
+ts_chunk_find(Hypertable *ht, Point *p, bool lock_slices)
 {
-	return chunk_find(ht, p, false);
+	return chunk_find(ht, p, false, lock_slices);
 }
 
 /*
@@ -1753,11 +1805,14 @@ append_chunk(ChunkScanCtx *scanctx, ChunkStub *stub)
 		Chunk **chunks = scanctx->data;
 
 		Assert(chunk != NULL);
-
-		if (NULL == chunks && scanctx->num_complete_chunks > 0)
-			scanctx->data = chunks = palloc(sizeof(Chunk *) * scanctx->num_complete_chunks);
-
 		Assert(scanctx->num_processed < scanctx->num_complete_chunks);
+
+		if (NULL == chunks)
+		{
+			Assert(scanctx->num_complete_chunks > 0);
+			scanctx->data = chunks = palloc(sizeof(Chunk *) * scanctx->num_complete_chunks);
+		}
+
 		chunks[scanctx->num_processed] = chunk;
 	}
 
@@ -1903,7 +1958,7 @@ get_chunks_in_time_range(Hypertable *ht, int64 older_than, int64 newer_than,
 				 errmsg("invalid time range"),
 				 errhint("The start of the time range must be before the end.")));
 
-	if (ht->fd.compressed)
+	if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
 		elog(ERROR, "invalid operation on compressed hypertable");
 
 	start_strategy = (newer_than == PG_INT64_MIN) ? InvalidStrategy : BTGreaterEqualStrategyNumber;
@@ -3090,94 +3145,6 @@ ts_chunk_drop_preserve_catalog_row(const Chunk *chunk, DropBehavior behavior, in
 }
 
 static void
-ts_chunk_drop_process_invalidations(Oid hypertable_relid, int64 older_than, int64 newer_than,
-									Chunk *chunks, int num_chunks)
-{
-	Dimension *time_dimension;
-	int64 ignore_invalidation_older_than;
-	int64 minimum_invalidation_time;
-	int64 lowest_completion_time;
-	List *continuous_aggs;
-	ListCell *lc;
-	Cache *hcache;
-	Hypertable *ht;
-	int i;
-	FormData_continuous_agg cagg;
-
-	ht = ts_hypertable_cache_get_cache_and_entry(hypertable_relid, CACHE_FLAG_NONE, &hcache);
-	time_dimension = hyperspace_get_open_dimension(ht->space, 0);
-
-	ignore_invalidation_older_than =
-		ts_continuous_aggs_max_ignore_invalidation_older_than(ht->fd.id, &cagg);
-	minimum_invalidation_time =
-		ts_continuous_aggs_get_minimum_invalidation_time(ts_get_now_internal(time_dimension),
-														 ignore_invalidation_older_than);
-
-	/* minimum_invalidation_time is inclusive; older_than_time is exclusive */
-	if (minimum_invalidation_time < older_than)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("older_than must be greater than the "
-						"timescaledb.ignore_invalidation_older_than "
-						"parameter of %s.%s",
-						cagg.user_view_schema.data,
-						cagg.user_view_name.data)));
-
-	/* error for now, maybe better as a warning and ignoring the chunks? */
-	/* We cannot move a completion threshold up transactionally without taking locks
-	 * that would block the system. So, just bail. The completion threshold
-	 * should be much higher than this anyway */
-	lowest_completion_time = ts_continuous_aggs_min_completed_threshold(ht->fd.id, &cagg);
-	if (lowest_completion_time < older_than)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("the continuous aggregate %s.%s is too far behind",
-						cagg.user_view_schema.data,
-						cagg.user_view_name.data)));
-
-	/* Lock all chunks in Exclusive mode, blocking everything but selects on the table. We have
-	 * to block all modifications so that we can't get new invalidation entries. This makes sure
-	 * that all future modifying txns on this data region will have a now() that higher than
-	 * ours and thus will not invalidate. Otherwise, we could have an old txn with a now() in
-	 * the past that all of a sudden decides to to insert data right after we
-	 * process_invalidations. */
-	for (i = 0; i < num_chunks; i++)
-	{
-		LockRelationOid(chunks[i].table_id, ExclusiveLock);
-	}
-
-	continuous_aggs = ts_continuous_aggs_find_by_raw_table_id(ht->fd.id);
-	foreach (lc, continuous_aggs)
-	{
-		ContinuousAgg *ca = lfirst(lc);
-		ContinuousAggMatOptions mat_options = {
-			.verbose = true,
-			.within_single_transaction = true,
-			.process_only_invalidation = true,
-			.invalidate_prior_to_time = older_than,
-		};
-		bool finished_all_invalidation = false;
-
-		/* This will loop until all invalidations are done, each iteration of the loop will do
-		 * max_interval_per_job's worth of data. We don't want to ignore max_interval_per_job
-		 * here to avoid large sorts. */
-		while (!finished_all_invalidation)
-		{
-			elog(NOTICE,
-				 "making sure all invalidations for %s.%s have been processed prior to "
-				 "dropping "
-				 "chunks",
-				 NameStr(ca->data.user_view_schema),
-				 NameStr(ca->data.user_view_name));
-			finished_all_invalidation =
-				ts_cm_functions->continuous_agg_materialize(ca->data.mat_hypertable_id,
-															&mat_options);
-		}
-	}
-	ts_cache_release(hcache);
-}
-
-static void
 lock_referenced_tables(Oid table_relid)
 {
 	List *fk_relids = NIL;
@@ -3278,13 +3245,33 @@ ts_chunk_do_drop_chunks(Hypertable *ht, int64 older_than, int64 newer_than, int3
 	DEBUG_WAITPOINT("drop_chunks_chunks_found");
 
 	if (has_continuous_aggs)
-		ts_chunk_drop_process_invalidations(ht->main_table_relid,
-											older_than,
-											newer_than,
-											chunks,
-											num_chunks);
+	{
+		int i;
 
-	for (; i < num_chunks; i++)
+		/* Exclusively lock all chunks, and invalidate the
+		 * continuous aggregates in the regions covered by the chunks. Locking
+		 * prevents further modification of the dropped region during this
+		 * transaction, which allows moving the invalidation threshold without
+		 * having to worry about new invalidations while refreshing. */
+		for (i = 0; i < num_chunks; i++)
+		{
+			int64 start = ts_chunk_primary_dimension_start(&chunks[i]);
+			int64 end = ts_chunk_primary_dimension_end(&chunks[i]);
+
+			LockRelationOid(chunks[i].table_id, ExclusiveLock);
+
+			Assert(hyperspace_get_open_dimension(ht->space, 0)->fd.id ==
+				   chunks[i].cube->slices[0]->fd.dimension_id);
+
+			/* Invalidate the dropped region to indicate that it was
+			 * modified. The invalidation will allow the refresh command on a
+			 * continuous aggregate to see that this region was dropped and
+			 * and will therefore be able to refresh accordingly.*/
+			ts_cm_functions->continuous_agg_invalidate(ht, start, end);
+		}
+	}
+
+	for (i = 0; i < num_chunks; i++)
 	{
 		char *chunk_name;
 		ListCell *lc;
@@ -3313,6 +3300,8 @@ ts_chunk_do_drop_chunks(Hypertable *ht, int64 older_than, int64 newer_than, int3
 
 	if (affected_data_nodes)
 		*affected_data_nodes = data_nodes;
+
+	DEBUG_WAITPOINT("drop_chunks_end");
 
 	return dropped_chunk_names;
 }
@@ -3375,12 +3364,14 @@ find_hypertable_from_table_or_cagg(Cache *hcache, Oid relid)
 	Hypertable *ht;
 
 	rel_name = get_rel_name(relid);
+
 	if (!rel_name)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("invalid hypertable or continuous aggregate")));
 
 	ht = ts_hypertable_cache_get_entry(hcache, relid, CACHE_FLAG_MISSING_OK);
+
 	if (ht)
 	{
 		const ContinuousAggHypertableStatus status = ts_continuous_agg_hypertable_status(ht->fd.id);
@@ -3401,29 +3392,23 @@ find_hypertable_from_table_or_cagg(Cache *hcache, Oid relid)
 	}
 	else
 	{
-		/* Using the name to look up the continuous aggregate, but we should
-		 * refactor the code to use the relid directly. */
-		const char *const schema_name = get_namespace_name(get_rel_namespace(relid));
-		ContinuousAgg *const cagg = ts_continuous_agg_find_userview_name(schema_name, rel_name);
-
-		Assert(schema_name && rel_name);
+		ContinuousAgg *const cagg = ts_continuous_agg_find_by_relid(relid);
 
 		if (!cagg)
 			ereport(ERROR,
 					(errcode(ERRCODE_TS_HYPERTABLE_NOT_EXIST),
-					 errmsg("\"%s.%s\" is not a hypertable or a continuous aggregate view",
-							schema_name,
-							rel_name),
+					 errmsg("\"%s\" is not a hypertable or a continuous aggregate", rel_name),
 					 errhint("The operation is only possible on a hypertable or continuous"
-							 " aggregate view")));
+							 " aggregate.")));
+
 		ht = ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
+
 		if (!ht)
 			ereport(ERROR,
 					(errcode(ERRCODE_TS_INTERNAL_ERROR),
-					 errmsg("no materialized table for continuous aggregate view"),
-					 errdetail("Continuous aggregate \"%s.%s\" had a materialized hypertable"
+					 errmsg("no materialized table for continuous aggregate"),
+					 errdetail("Continuous aggregate \"%s\" had a materialized hypertable"
 							   " with id %d but it was not found in the hypertable catalog.",
-							   schema_name,
 							   rel_name,
 							   cagg->data.mat_hypertable_id)));
 	}
@@ -3449,7 +3434,7 @@ ts_chunk_drop_chunks(PG_FUNCTION_ARGS)
 	Dimension *time_dim;
 	Oid time_type;
 
-	PreventCommandIfReadOnly(DROP_CHUNKS_FUNCNAME "()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	/*
 	 * When past the first call of the SRF, dropping has already been completed,
@@ -3513,10 +3498,14 @@ ts_chunk_drop_chunks(PG_FUNCTION_ARGS)
 		 * CASCADE (we don't support it), so we replace the hint with a more
 		 * accurate hint for our situation. */
 		ErrorData *edata;
+
 		MemoryContextSwitchTo(oldcontext);
 		edata = CopyErrorData();
 		FlushErrorState();
-		edata->hint = pstrdup("Use DROP ... to drop the dependent objects.");
+
+		if (edata->sqlerrcode == ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST)
+			edata->hint = pstrdup("Use DROP ... to drop the dependent objects.");
+
 		ts_cache_release(hcache);
 		ReThrowError(edata);
 	}
@@ -3545,11 +3534,14 @@ ts_chunk_drop_chunks(PG_FUNCTION_ARGS)
 Datum
 ts_chunks_in(PG_FUNCTION_ARGS)
 {
+	const char *funcname = get_func_name(FC_FN_OID(fcinfo));
+
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("illegal invocation of chunks_in function"),
-			 errhint("chunks_in function must appear in the WHERE clause and can only be combined "
-					 "with AND operator")));
+			 errmsg("illegal invocation of %s function", funcname),
+			 errhint("The %s function must appear in the WHERE clause and can only"
+					 " be combined with AND operator.",
+					 funcname)));
 	pg_unreachable();
 }
 

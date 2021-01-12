@@ -12,9 +12,12 @@
  */
 #include <postgres.h>
 #include <access/xact.h>
+#include <access/reloptions.h>
 #include <catalog/pg_foreign_server.h>
+#include <catalog/pg_user_mapping.h>
 #include <commands/defrem.h>
 #include <common/md5.h>
+#include <foreign/foreign.h>
 #include <libpq-events.h>
 #include <libpq/libpq.h>
 #include <mb/pg_wchar.h>
@@ -26,7 +29,9 @@
 #include <utils/fmgrprotos.h>
 #include <utils/inval.h>
 #include <utils/guc.h>
+#include <utils/syscache.h>
 
+#include <annotations.h>
 #include <dist_util.h>
 #include <errors.h>
 #include <extension_constants.h>
@@ -450,7 +455,6 @@ extract_connection_options(List *defelems, const char **keywords, const char **v
 		}
 	}
 
-	Assert(*user != NULL);
 	return option_pos;
 }
 
@@ -915,23 +919,19 @@ remote_validate_extension_version(TSConnection *conn, const char *data_node_vers
  * Compare remote connection extension version with the one installed
  * locally on the access node.
  *
- * If `owner` is a non-null pointer, it will be updated with the name of the
- * owner of the extension.
- *
  * Return false if extension is not found, true otherwise.
  */
 bool
-remote_connection_check_extension(TSConnection *conn, const char **owner_name, Oid *owner_oid)
+remote_connection_check_extension(TSConnection *conn)
 {
 	PGresult *res;
 
 	res = remote_connection_execf(conn,
-								  "SELECT usename, extowner, extversion FROM pg_extension JOIN "
-								  "pg_user ON extowner = usesysid WHERE extname = %s",
+								  "SELECT extversion FROM pg_extension WHERE extname = %s",
 								  quote_literal_cstr(EXTENSION_NAME));
 
 	/* Just to capture any bugs in the SELECT above */
-	Assert(PQnfields(res) == 3);
+	Assert(PQnfields(res) == 1);
 
 	switch (PQntuples(res))
 	{
@@ -951,14 +951,7 @@ remote_connection_check_extension(TSConnection *conn, const char **owner_name, O
 
 	/* validate extension version on data node and make sure that it is
 	 * compatible */
-	remote_validate_extension_version(conn, PQgetvalue(res, 0, 2));
-
-	/* extract owner */
-	if (owner_name != NULL)
-		*owner_name = pstrdup(PQgetvalue(res, 0, 0));
-
-	if (owner_oid != NULL)
-		*owner_oid = pg_atoi(PQgetvalue(res, 0, 1), sizeof(int32), 0);
+	remote_validate_extension_version(conn, PQgetvalue(res, 0, 0));
 
 	PQclear(res);
 	return true;
@@ -997,6 +990,10 @@ remote_connection_set_peer_dist_id(TSConnection *conn)
 
 /* sslmode, sslrootcert, sslcert, sslkey */
 #define REMOTE_CONNECTION_SSL_OPTIONS_N 4
+
+#define REMOTE_CONNECTION_OPTIONS_TOTAL_N                                                          \
+	(REMOTE_CONNECTION_SESSION_OPTIONS_N + REMOTE_CONNECTION_PASSWORD_OPTIONS_N +                  \
+	 REMOTE_CONNECTION_SSL_OPTIONS_N)
 
 /* default password file basename */
 #define DEFAULT_PASSFILE_NAME "passfile"
@@ -1066,20 +1063,22 @@ report_path_error(PathKind path_kind, const char *user_name)
 static StringInfo
 make_user_path(const char *user_name, PathKind path_kind)
 {
-	const char *ssl_dir = ts_guc_ssl_dir ? ts_guc_ssl_dir : DataDir;
 	char ret_path[MAXPGPATH];
 	char hexsum[33];
 	StringInfo result;
 
 	pg_md5_hash(user_name, strlen(user_name), hexsum);
 
-	if (strlcpy(ret_path, ssl_dir, MAXPGPATH) > MAXPGPATH)
+	if (strlcpy(ret_path, ts_guc_ssl_dir ? ts_guc_ssl_dir : DataDir, MAXPGPATH) > MAXPGPATH)
 		report_path_error(path_kind, user_name);
-
 	canonicalize_path(ret_path);
 
-	join_path_components(ret_path, ret_path, EXTENSION_NAME);
-	join_path_components(ret_path, ret_path, "certs");
+	if (!ts_guc_ssl_dir)
+	{
+		join_path_components(ret_path, ret_path, EXTENSION_NAME);
+		join_path_components(ret_path, ret_path, "certs");
+	}
+
 	join_path_components(ret_path, ret_path, hexsum);
 
 	result = makeStringInfo();
@@ -1134,6 +1133,23 @@ set_ssl_options(const char *user_name, const char **keywords, const char **value
 }
 
 /*
+ * Finish the connection and, optionally, save the connection error.
+ */
+static void
+finish_connection(PGconn *conn, char **errmsg)
+{
+	if (NULL != errmsg)
+	{
+		if (NULL == conn)
+			*errmsg = "invalid connection";
+		else
+			*errmsg = pchomp(PQerrorMessage(conn));
+	}
+
+	PQfinish(conn);
+}
+
+/*
  * This will only open a connection to a specific node, but not do anything
  * else. In particular, it will not perform any validation nor configure the
  * connection since it cannot know that it connects to a data node database or
@@ -1141,15 +1157,19 @@ set_ssl_options(const char *user_name, const char **keywords, const char **value
  * function.
  */
 TSConnection *
-remote_connection_open_with_options_nothrow(const char *node_name, List *connection_options)
+remote_connection_open_with_options_nothrow(const char *node_name, List *connection_options,
+											char **errmsg)
 {
-	PGconn *pg_conn = NULL;
+	PGconn *volatile pg_conn = NULL;
 	const char *user_name = NULL;
 	TSConnection *ts_conn;
 	const char **keywords;
 	const char **values;
 	int option_count;
 	int option_pos;
+
+	if (NULL != errmsg)
+		*errmsg = NULL;
 
 	/*
 	 * Construct connection params from generic options of ForeignServer
@@ -1158,12 +1178,14 @@ remote_connection_open_with_options_nothrow(const char *node_name, List *connect
 	 * for fallback_application_name, client_encoding, end marker.
 	 * One additional slot to set passfile and 4 slots for ssl options.
 	 */
-	option_count = list_length(connection_options) + REMOTE_CONNECTION_SESSION_OPTIONS_N +
-				   REMOTE_CONNECTION_PASSWORD_OPTIONS_N + REMOTE_CONNECTION_SSL_OPTIONS_N;
+	option_count = list_length(connection_options) + REMOTE_CONNECTION_OPTIONS_TOTAL_N;
 	keywords = (const char **) palloc(option_count * sizeof(char *));
 	values = (const char **) palloc(option_count * sizeof(char *));
 
 	option_pos = extract_connection_options(connection_options, keywords, values, &user_name);
+
+	if (NULL == user_name)
+		user_name = GetUserNameFromId(GetUserId(), false);
 
 	/* Use the extension name as fallback_application_name. */
 	keywords[option_pos] = "fallback_application_name";
@@ -1185,7 +1207,7 @@ remote_connection_open_with_options_nothrow(const char *node_name, List *connect
 	keywords[option_pos] = values[option_pos] = NULL;
 	Assert(option_pos <= option_count);
 
-	pg_conn = PQconnectdbParams(keywords, values, false);
+	pg_conn = PQconnectdbParams(keywords, values, 0 /* Do not expand dbname param */);
 
 	/* Cast to (char **) to silence warning with MSVC compiler */
 	pfree((char **) keywords);
@@ -1194,10 +1216,16 @@ remote_connection_open_with_options_nothrow(const char *node_name, List *connect
 	if (NULL == pg_conn)
 		return NULL;
 
+	if (PQstatus(pg_conn) != CONNECTION_OK)
+	{
+		finish_connection(pg_conn, errmsg);
+		return NULL;
+	}
+
 	ts_conn = remote_connection_create(pg_conn, false, node_name);
 
 	if (NULL == ts_conn)
-		PQfinish(pg_conn);
+		finish_connection(pg_conn, errmsg);
 
 	return ts_conn;
 }
@@ -1216,12 +1244,15 @@ TSConnection *
 remote_connection_open_with_options(const char *node_name, List *connection_options,
 									bool set_dist_id)
 {
-	TSConnection *conn = remote_connection_open_with_options_nothrow(node_name, connection_options);
+	char *err = NULL;
+	TSConnection *conn =
+		remote_connection_open_with_options_nothrow(node_name, connection_options, &err);
 
 	if (NULL == conn)
 		ereport(ERROR,
 				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-				 errmsg("could not connect to \"%s\"", node_name)));
+				 errmsg("could not connect to \"%s\"", node_name),
+				 err == NULL ? 0 : errdetail_internal("%s", err)));
 
 	/*
 	 * Use PG_TRY block to ensure closing connection on error.
@@ -1245,7 +1276,7 @@ remote_connection_open_with_options(const char *node_name, List *connection_opti
 
 		/* Check a data node extension version and show a warning
 		 * message if it differs */
-		remote_connection_check_extension(conn, NULL, NULL);
+		remote_connection_check_extension(conn);
 
 		if (set_dist_id)
 		{
@@ -1268,21 +1299,101 @@ remote_connection_open_with_options(const char *node_name, List *connection_opti
 	return conn;
 }
 
-static List *
-add_username_to_server_options(ForeignServer *server, Oid user_id)
+/*
+ * Based on PG's GetUserMapping, but this version does not fail when a user
+ * mapping is not found.
+ */
+static UserMapping *
+get_user_mapping(Oid userid, Oid serverid)
 {
-	const char *user_name = GetUserNameFromId(user_id, false);
-	List *server_options = list_copy(server->options);
+	Datum datum;
+	HeapTuple tp;
+	bool isnull;
+	UserMapping *um;
 
-	return lappend(server_options,
-				   makeDefElem("user", (Node *) makeString(pstrdup(user_name)), -1));
+	tp = SearchSysCache2(USERMAPPINGUSERSERVER,
+						 ObjectIdGetDatum(userid),
+						 ObjectIdGetDatum(serverid));
+
+	if (!HeapTupleIsValid(tp))
+	{
+		/* Not found for the specific user -- try PUBLIC */
+		tp = SearchSysCache2(USERMAPPINGUSERSERVER,
+							 ObjectIdGetDatum(InvalidOid),
+							 ObjectIdGetDatum(serverid));
+	}
+
+	if (!HeapTupleIsValid(tp))
+		return NULL;
+
+	um = (UserMapping *) palloc(sizeof(UserMapping));
+#if PG12_GE
+	um->umid = ((Form_pg_user_mapping) GETSTRUCT(tp))->oid;
+#else
+	um->umid = HeapTupleGetOid(tp);
+#endif
+	um->userid = userid;
+	um->serverid = serverid;
+
+	/* Extract the umoptions */
+	datum = SysCacheGetAttr(USERMAPPINGUSERSERVER, tp, Anum_pg_user_mapping_umoptions, &isnull);
+	if (isnull)
+		um->options = NIL;
+	else
+		um->options = untransformRelOptions(datum);
+
+	ReleaseSysCache(tp);
+
+	return um;
+}
+
+static bool
+options_contain(List *options, const char *key)
+{
+	ListCell *lc;
+
+	foreach (lc, options)
+	{
+		DefElem *d = (DefElem *) lfirst(lc);
+
+		if (strcmp(d->defname, key) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Add user info (username and optionally password) to the connection
+ * options).
+ */
+static List *
+add_userinfo_to_server_options(ForeignServer *server, Oid user_id)
+{
+	const UserMapping *um = get_user_mapping(user_id, server->serverid);
+	List *options = list_copy(server->options);
+
+	/* If a user mapping exists, then use the "user" and "password" options
+	 * from the user mapping (we assume that these options exist, or the
+	 * connection will later fail). Otherwise, just add the "user" and rely on
+	 * other authentication mechanisms. */
+	if (NULL != um)
+		options = list_concat(options, um->options);
+
+	if (!options_contain(options, "user"))
+	{
+		char *user_name = GetUserNameFromId(user_id, false);
+		options = lappend(options, makeDefElem("user", (Node *) makeString(user_name), -1));
+	}
+
+	return options;
 }
 
 TSConnection *
 remote_connection_open_by_id(TSConnectionId id)
 {
 	ForeignServer *server = GetForeignServer(id.server_id);
-	List *connection_options = add_username_to_server_options(server, id.user_id);
+	List *connection_options = add_userinfo_to_server_options(server, id.user_id);
 
 	return remote_connection_open_with_options(server->servername, connection_options, true);
 }
@@ -1315,12 +1426,13 @@ remote_connection_open_nothrow(Oid server_id, Oid user_id, char **errmsg)
 		return NULL;
 	}
 
-	connection_options = add_username_to_server_options(server, user_id);
-	conn = remote_connection_open_with_options_nothrow(server->servername, connection_options);
+	connection_options = add_userinfo_to_server_options(server, user_id);
+	conn =
+		remote_connection_open_with_options_nothrow(server->servername, connection_options, errmsg);
 
 	if (NULL == conn)
 	{
-		if (NULL != errmsg)
+		if (NULL != errmsg && NULL == *errmsg)
 			*errmsg = "internal connection error";
 		return NULL;
 	}
@@ -1419,9 +1531,11 @@ remote_connection_get_prep_stmt_number()
 	return ++prep_stmt_number;
 }
 
+#define MAX_CONN_WAIT_TIMEOUT_MS 60000
+
 /*
  * Drain a connection of all data coming in and discard the results. Return
- * success if all data is drained before the deadline expires.
+ * CONN_OK if all data is drained before the deadline expires.
  *
  * This is mainly used in abort processing. This result being returned
  * might be for a query that is being interrupted by transaction abort, or it might
@@ -1436,66 +1550,105 @@ remote_connection_get_prep_stmt_number()
  * end_time is the time at which we should give up and assume the remote
  * side is dead.
  */
-
-static bool
-remote_connection_drain(PGconn *conn, TimestampTz endtime)
+TSConnectionResult
+remote_connection_drain(TSConnection *conn, TimestampTz endtime, PGresult **result)
 {
-	for (;;)
+	volatile TSConnectionResult connresult = CONN_OK;
+	PGresult *volatile last_res = NULL;
+	PGconn *pg_conn = remote_connection_get_pg_conn(conn);
+
+	/* In what follows, do not leak any PGresults on an error. */
+	PG_TRY();
 	{
-		PGresult *res;
-
-		while (PQisBusy(conn))
+		for (;;)
 		{
-			int wc;
-			TimestampTz now = GetCurrentTimestamp();
-			long secs;
-			int microsecs;
-			long cur_timeout;
+			PGresult *res;
 
-			/* If timeout has expired, give up, else get sleep time. */
-			if (now >= endtime)
+			while (PQisBusy(pg_conn))
 			{
-				elog(WARNING, "timeout occured while trying to drain the connection");
-				return false;
+				int wc;
+				TimestampTz now = GetCurrentTimestamp();
+				long remaining_secs;
+				int remaining_usecs;
+				long cur_timeout_ms;
+
+				/* If timeout has expired, give up, else get sleep time. */
+				if (now >= endtime)
+				{
+					connresult = CONN_TIMEOUT;
+					goto exit;
+				}
+
+				TimestampDifference(now, endtime, &remaining_secs, &remaining_usecs);
+
+				/* To protect against clock skew, limit sleep to one minute. */
+				cur_timeout_ms =
+					Min(MAX_CONN_WAIT_TIMEOUT_MS, remaining_secs * USECS_PER_SEC + remaining_usecs);
+
+				/* Sleep until there's something to do */
+				wc = WaitLatchOrSocket(MyLatch,
+									   WL_LATCH_SET | WL_SOCKET_READABLE
+#if PG12_GE
+										   | WL_EXIT_ON_PM_DEATH
+#endif
+										   | WL_TIMEOUT,
+									   PQsocket(pg_conn),
+									   cur_timeout_ms,
+									   PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+
+				CHECK_FOR_INTERRUPTS();
+
+				/* Data available in socket? */
+				if ((wc & WL_SOCKET_READABLE) && (0 == PQconsumeInput(pg_conn)))
+				{
+					connresult = CONN_DISCONNECT;
+					goto exit;
+				}
 			}
 
-			TimestampDifference(now, endtime, &secs, &microsecs);
+			res = PQgetResult(pg_conn);
 
-			/* To protect against clock skew, limit sleep to one minute. */
-			cur_timeout = Min(60000, secs * USECS_PER_SEC + microsecs);
-
-			/* Sleep until there's something to do */
-			wc = WaitLatchOrSocket(MyLatch,
-								   WL_LATCH_SET | WL_SOCKET_READABLE | WL_TIMEOUT |
-									   WL_POSTMASTER_DEATH,
-								   PQsocket(conn),
-								   cur_timeout,
-								   PG_WAIT_EXTENSION);
-			ResetLatch(MyLatch);
-
-			CHECK_FOR_INTERRUPTS();
-
-			if (wc & WL_POSTMASTER_DEATH)
+			if (res == NULL)
 			{
-				/* Postmaster died -> exit) */
-				return false;
+				/* query is complete */
+				remote_connection_set_processing(conn, false);
+				connresult = CONN_OK;
+				break;
 			}
 
-			/* Data available in socket? */
-			if (wc & WL_SOCKET_READABLE)
-			{
-				if (!PQconsumeInput(conn))
-					/* connection trouble; treat the same as a timeout */
-					return false;
-			}
+			PQclear(last_res);
+			last_res = res;
 		}
-
-		res = PQgetResult(conn);
-		if (res == NULL)
-			return true; /* query is complete */
-		PQclear(res);
+	exit:;
 	}
-	Assert(false);
+	PG_CATCH();
+	{
+		PQclear(last_res);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	switch (connresult)
+	{
+		case CONN_OK:
+			if (last_res == NULL)
+				connresult = CONN_NO_RESPONSE;
+			else if (result != NULL)
+				*result = last_res;
+			else
+				PQclear(last_res);
+			break;
+		case CONN_TIMEOUT:
+		case CONN_DISCONNECT:
+			PQclear(last_res);
+			break;
+		case CONN_NO_RESPONSE:
+			Assert(last_res == NULL);
+			break;
+	}
+
+	return connresult;
 }
 
 /*
@@ -1539,7 +1692,16 @@ remote_connection_cancel_query(TSConnection *conn)
 		PQfreeCancel(cancel);
 	}
 
-	return remote_connection_drain(conn->pg_conn, endtime);
+	switch (remote_connection_drain(conn, endtime, NULL))
+	{
+		case CONN_OK:
+			/* Successfully, drained */
+		case CONN_NO_RESPONSE:
+			/* No response, likely beceause there was nothing to cancel */
+			return true;
+		default:
+			return false;
+	}
 }
 
 void
@@ -1652,7 +1814,7 @@ remote_connection_set_single_row_mode(TSConnection *conn)
 	return PQsetSingleRowMode(conn->pg_conn);
 }
 
-#if TS_DEBUG
+#ifdef TS_DEBUG
 /*
  * Reset the current connection stats.
  */

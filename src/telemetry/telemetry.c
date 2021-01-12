@@ -54,17 +54,22 @@
 #define REQ_NUM_HYPERTABLES "num_hypertables"
 #define REQ_NUM_COMPRESSED_HYPERTABLES "num_compressed_hypertables"
 #define REQ_NUM_CONTINUOUS_AGGS "num_continuous_aggs"
-#define REQ_NUM_REORDER_POLICIES "num_reorder_policies"
-#define REQ_NUM_DROP_CHUNKS_POLICIES "num_drop_chunks_policies"
+#define REQ_NUM_POLICY_CAGG "num_continuous_aggs_policies"
+#define REQ_NUM_POLICY_COMPRESSION "num_compression_policies"
+#define REQ_NUM_POLICY_REORDER "num_reorder_policies"
+#define REQ_NUM_POLICY_RETENTION "num_retention_policies"
+#define REQ_NUM_USER_DEFINED_ACTIONS "num_user_defined_actions"
 #define REQ_RELATED_EXTENSIONS "related_extensions"
 #define REQ_METADATA "db_metadata"
 #define REQ_LICENSE_EDITION_APACHE "apache_only"
+#define REQ_LICENSE_EDITION_COMMUNITY "community"
 #define REQ_TS_LAST_TUNE_TIME "last_tuned_time"
 #define REQ_TS_LAST_TUNE_VERSION "last_tuned_version"
 #define REQ_INSTANCE_METADATA "instance_metadata"
 #define REQ_TS_TELEMETRY_CLOUD "cloud"
 
 #define PG_PROMETHEUS "pg_prometheus"
+#define PROMSCALE "promscale"
 #define POSTGIS "postgis"
 
 #define REQ_COMPRESSED_HEAP_SIZE "compressed_heap_size"
@@ -76,7 +81,7 @@
 
 #define TS_TELEMETRY_REPORT_OVERRIDE_ARG "always_display_report := true"
 
-static const char *related_extensions[] = { PG_PROMETHEUS, POSTGIS };
+static const char *related_extensions[] = { PG_PROMETHEUS, PROMSCALE, POSTGIS };
 
 static bool
 char_in_valid_version_digits(const char c)
@@ -166,7 +171,7 @@ ts_check_version_response(const char *json)
 
 		ereport(LOG,
 				(errmsg("the \"%s\" extension is not up-to-date", EXTENSION_NAME),
-				 errhint("The most up-to-date version is %s, the installed version is %s",
+				 errhint("The most up-to-date version is %s, the installed version is %s.",
 						 result.versionstr,
 						 TIMESCALEDB_VERSION_MOD)));
 	}
@@ -225,22 +230,16 @@ get_num_continuous_aggs()
 	return buf->data;
 }
 
-static char *
-get_num_drop_chunks_policies()
+static void
+add_job_counts(JsonbParseState *state)
 {
-	StringInfo buf = makeStringInfo();
+	BgwJobTypeCount counts = ts_bgw_job_type_counts();
 
-	appendStringInfo(buf, "%d", ts_bgw_policy_retention_count());
-	return buf->data;
-}
-
-static char *
-get_num_reorder_policies()
-{
-	StringInfo buf = makeStringInfo();
-
-	appendStringInfo(buf, "%d", ts_bgw_policy_reorder_count());
-	return buf->data;
+	ts_jsonb_add_int32(state, REQ_NUM_POLICY_CAGG, counts.policy_cagg);
+	ts_jsonb_add_int32(state, REQ_NUM_POLICY_COMPRESSION, counts.policy_compression);
+	ts_jsonb_add_int32(state, REQ_NUM_POLICY_REORDER, counts.policy_reorder);
+	ts_jsonb_add_int32(state, REQ_NUM_POLICY_RETENTION, counts.policy_retention);
+	ts_jsonb_add_int32(state, REQ_NUM_USER_DEFINED_ACTIONS, counts.user_defined_action);
 }
 
 static char *
@@ -353,8 +352,8 @@ build_version_body(void)
 	ts_jsonb_add_str(parse_state, REQ_NUM_HYPERTABLES, get_num_hypertables());
 	ts_jsonb_add_str(parse_state, REQ_NUM_COMPRESSED_HYPERTABLES, get_num_compressed_hypertables());
 	ts_jsonb_add_str(parse_state, REQ_NUM_CONTINUOUS_AGGS, get_num_continuous_aggs());
-	ts_jsonb_add_str(parse_state, REQ_NUM_REORDER_POLICIES, get_num_reorder_policies());
-	ts_jsonb_add_str(parse_state, REQ_NUM_DROP_CHUNKS_POLICIES, get_num_drop_chunks_policies());
+
+	add_job_counts(parse_state);
 
 	ts_jsonb_add_str(parse_state, REQ_COMPRESSED_HEAP_SIZE, get_size(sizes.compressed_heap_size));
 	ts_jsonb_add_str(parse_state, REQ_COMPRESSED_INDEX_SIZE, get_size(sizes.compressed_index_size));
@@ -376,22 +375,21 @@ build_version_body(void)
 	pushJsonbValue(&parse_state, WJB_KEY, &ext_key);
 	add_related_extensions(parse_state);
 
-	if (TS_CURRENT_LICENSE_IS_APACHE_ONLY())
-	{
-		/* license */
-		license_info_key.type = jbvString;
-		license_info_key.val.string.val = REQ_LICENSE_INFO;
-		license_info_key.val.string.len = strlen(REQ_LICENSE_INFO);
-		pushJsonbValue(&parse_state, WJB_KEY, &license_info_key);
-		pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
+	/* license */
+	license_info_key.type = jbvString;
+	license_info_key.val.string.val = REQ_LICENSE_INFO;
+	license_info_key.val.string.len = strlen(REQ_LICENSE_INFO);
+	pushJsonbValue(&parse_state, WJB_KEY, &license_info_key);
+	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
+	if (ts_license_is_apache())
 		ts_jsonb_add_str(parse_state, REQ_LICENSE_EDITION, REQ_LICENSE_EDITION_APACHE);
-		pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
-	}
 	else
-	{
-		/* add license and distributed database fields */
+		ts_jsonb_add_str(parse_state, REQ_LICENSE_EDITION, REQ_LICENSE_EDITION_COMMUNITY);
+	pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
+
+	/* add distributed database fields */
+	if (!ts_license_is_apache())
 		ts_cm_functions->add_tsl_telemetry_info(&parse_state);
-	}
 
 	/* add tuned info, which is optional */
 	if (ts_last_tune_time != NULL)
@@ -504,6 +502,9 @@ ts_telemetry_main(const char *host, const char *path, const char *service)
 	HttpResponseState *rsp;
 	bool started = false;
 	const char *volatile json = NULL;
+
+	if (!ts_telemetry_on())
+		return false;
 
 	if (!IsTransactionOrTransactionBlock())
 	{

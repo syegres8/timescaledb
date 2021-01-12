@@ -37,11 +37,11 @@ NOTICE:  adding not-null constraint to column "time"
 (1 row)
 
 SELECT * FROM _timescaledb_catalog.hypertable;
- id | schema_name | table_name | associated_schema_name | associated_table_prefix | num_dimensions | chunk_sizing_func_schema |  chunk_sizing_func_name  | chunk_target_size | compressed | compressed_hypertable_id | replication_factor 
-----+-------------+------------+------------------------+-------------------------+----------------+--------------------------+--------------------------+-------------------+------------+--------------------------+--------------------
-  1 | public      | test_ts    | _timescaledb_internal  | _hyper_1                |              2 | _timescaledb_internal    | calculate_chunk_interval |                 0 | f          |                          |                   
-  2 | public      | test_tz    | _timescaledb_internal  | _hyper_2                |              2 | _timescaledb_internal    | calculate_chunk_interval |                 0 | f          |                          |                   
-  3 | public      | test_dt    | _timescaledb_internal  | _hyper_3                |              2 | _timescaledb_internal    | calculate_chunk_interval |                 0 | f          |                          |                   
+ id | schema_name | table_name | associated_schema_name | associated_table_prefix | num_dimensions | chunk_sizing_func_schema |  chunk_sizing_func_name  | chunk_target_size | compression_state | compressed_hypertable_id | replication_factor 
+----+-------------+------------+------------------------+-------------------------+----------------+--------------------------+--------------------------+-------------------+-------------------+--------------------------+--------------------
+  1 | public      | test_ts    | _timescaledb_internal  | _hyper_1                |              2 | _timescaledb_internal    | calculate_chunk_interval |                 0 |                 0 |                          |                   
+  2 | public      | test_tz    | _timescaledb_internal  | _hyper_2                |              2 | _timescaledb_internal    | calculate_chunk_interval |                 0 |                 0 |                          |                   
+  3 | public      | test_dt    | _timescaledb_internal  | _hyper_3                |              2 | _timescaledb_internal    | calculate_chunk_interval |                 0 |                 0 |                          |                   
 (3 rows)
 
 INSERT INTO test_ts VALUES('Mon Mar 20 09:17:00.936242 2017', 23.4, 'dev1');
@@ -112,7 +112,7 @@ SELECT AVG(temp) AS avg_tmp, "testSchema0".time_bucket('1 day', time, INTERVAL '
 -- testing time_bucket END
 -- testing drop_chunks START
 -- show_chunks and drop_chunks output should be the same
-\set QUERY1 'SELECT "testSchema0".show_chunks(older_than => \'2017-03-01\'::timestamp, hypertable_or_cagg => \'test_ts\')::REGCLASS::TEXT'
+\set QUERY1 'SELECT "testSchema0".show_chunks(older_than => \'2017-03-01\'::timestamp, relation => \'test_ts\')::REGCLASS::TEXT'
 \set QUERY2 'SELECT "testSchema0".drop_chunks(\'test_ts\', \'2017-03-01\'::timestamp)::TEXT'
 \set ECHO errors
  Different Rows | Total Rows from Query 1 | Total Rows from Query 2 
@@ -129,7 +129,7 @@ SELECT * FROM test_ts ORDER BY time;
  Mon Mar 20 09:37:00.936242 2017 |   30 | dev3
 (4 rows)
 
-\set QUERY1 'SELECT "testSchema0".show_chunks(older_than => interval \'1 minutes\', hypertable_or_cagg => \'test_tz\')::REGCLASS::TEXT'
+\set QUERY1 'SELECT "testSchema0".show_chunks(older_than => interval \'1 minutes\', relation => \'test_tz\')::REGCLASS::TEXT'
 \set QUERY2 'SELECT "testSchema0".drop_chunks(\'test_tz\', interval \'1 minutes\')::TEXT'
 \set ECHO errors
  Different Rows | Total Rows from Query 1 | Total Rows from Query 2 
@@ -142,7 +142,7 @@ SELECT * FROM test_tz ORDER BY time;
 ------+------+--------
 (0 rows)
 
-\set QUERY1 'SELECT "testSchema0".show_chunks(older_than => interval \'1 minutes\', hypertable_or_cagg => \'test_dt\')::REGCLASS::TEXT'
+\set QUERY1 'SELECT "testSchema0".show_chunks(older_than => interval \'1 minutes\', relation => \'test_dt\')::REGCLASS::TEXT'
 \set QUERY2 'SELECT "testSchema0".drop_chunks(\'test_dt\', interval \'1 minutes\')::TEXT'
 \set ECHO errors
  Different Rows | Total Rows from Query 1 | Total Rows from Query 2 

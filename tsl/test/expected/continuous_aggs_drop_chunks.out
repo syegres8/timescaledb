@@ -11,7 +11,7 @@ CREATE TABLE clients (
        UNIQUE(name)
 );
 CREATE TABLE records (
-    time TIMESTAMPTZ NOT NULL, 
+    time TIMESTAMPTZ NOT NULL,
     clientId INT NOT NULL REFERENCES clients(id),
     value DOUBLE PRECISION,
     UNIQUE(time, clientId)
@@ -23,19 +23,17 @@ SELECT * FROM create_hypertable('records', 'time',
              1 | public      | records    | t
 (1 row)
 
-CREATE MATERIALIZED VIEW records_monthly 
+CREATE MATERIALIZED VIEW records_monthly
     WITH (timescaledb.continuous)
-    AS 
-        SELECT time_bucket('1d', time) as bucket, 
-            clientId, 
+    AS
+        SELECT time_bucket('1d', time) as bucket,
+            clientId,
             avg(value) as value_avg,
-            max(value)-min(value) as value_spread 
-        FROM records GROUP BY bucket, clientId;
-NOTICE:  adding index _materialized_hypertable_2_clientid_bucket_idx ON _timescaledb_internal._materialized_hypertable_2 USING BTREE(clientid, bucket)
+            max(value)-min(value) as value_spread
+        FROM records GROUP BY bucket, clientId WITH NO DATA;
 INSERT INTO clients(name) VALUES ('test-client');
 INSERT INTO records
 SELECT generate_series('2000-03-01'::timestamptz,'2000-04-01','1 day'),1,3.14;
-SET timescaledb.current_timestamp_mock = '2000-04-01';
 SELECT * FROM records_monthly;
             bucket            | clientid | value_avg | value_spread 
 ------------------------------+----------+-----------+--------------
@@ -73,18 +71,15 @@ SELECT * FROM records_monthly;
  Fri Mar 03 16:00:00 2000 PST |        1 |      3.14 |            0
 (32 rows)
 
-ALTER MATERIALIZED VIEW records_monthly SET (
-   timescaledb.ignore_invalidation_older_than = '15 days'
-);
-SELECT chunk_name, range_start, range_end 
-FROM timescaledb_information.chunks 
+SELECT chunk_name, range_start, range_end
+FROM timescaledb_information.chunks
 WHERE hypertable_name = 'records_monthly' ORDER BY range_start;
  chunk_name | range_start | range_end 
 ------------+-------------+-----------
 (0 rows)
 
-SELECT chunk_name, range_start, range_end 
-FROM timescaledb_information.chunks 
+SELECT chunk_name, range_start, range_end
+FROM timescaledb_information.chunks
 WHERE hypertable_name = 'records' ORDER BY range_start;
     chunk_name     |         range_start          |          range_end           
 -------------------+------------------------------+------------------------------
@@ -122,12 +117,9 @@ WHERE hypertable_name = 'records' ORDER BY range_start;
  _hyper_1_32_chunk | Sat Apr 01 00:00:00 2000 PST | Sat Apr 01 01:00:00 2000 PST
 (32 rows)
 
-REFRESH MATERIALIZED VIEW records_monthly;
-WARNING:  REFRESH did not materialize the entire range since it was limited by the max_interval_per_job setting
-REFRESH MATERIALIZED VIEW records_monthly;
+CALL refresh_continuous_aggregate('records_monthly', NULL, NULL);
 \set VERBOSITY default
 SELECT drop_chunks('records', '2000-03-16'::timestamptz);
-NOTICE:  making sure all invalidations for public.records_monthly have been processed prior to dropping chunks
                drop_chunks               
 -----------------------------------------
  _timescaledb_internal._hyper_1_1_chunk
@@ -146,4 +138,191 @@ NOTICE:  making sure all invalidations for public.records_monthly have been proc
  _timescaledb_internal._hyper_1_14_chunk
  _timescaledb_internal._hyper_1_15_chunk
 (15 rows)
+
+\set VERBOSITY terse
+DROP MATERIALIZED VIEW records_monthly;
+NOTICE:  drop cascades to 32 other objects
+DROP TABLE records;
+DROP TABLE clients;
+\set VERBOSITY default
+-- Test that a continuous aggregate is refreshed correctly inside given chunk,
+-- so it can be used together with user retention.
+-- Shows that it is not affected by issue #2592.
+CREATE OR REPLACE FUNCTION test_int_now() returns INT LANGUAGE SQL STABLE as 
+    $$ SELECT 125 $$;
+CREATE TABLE conditions(time_int INT NOT NULL, device INT, value FLOAT);
+SELECT create_hypertable('conditions', 'time_int', chunk_time_interval => 10);
+    create_hypertable    
+-------------------------
+ (3,public,conditions,t)
+(1 row)
+
+INSERT INTO conditions
+SELECT time_val, time_val % 4, 3.14 FROM generate_series(0,100,1) AS time_val;
+SELECT set_integer_now_func('conditions', 'test_int_now');
+ set_integer_now_func 
+----------------------
+ 
+(1 row)
+
+CREATE MATERIALIZED VIEW conditions_7
+    WITH (timescaledb.continuous, timescaledb.materialized_only = TRUE)
+    AS
+        SELECT time_bucket(7, time_int) as bucket,
+            SUM(value), COUNT(value)
+        FROM conditions GROUP BY bucket WITH DATA;
+NOTICE:  refreshing continuous aggregate "conditions_7"
+HINT:  Use WITH NO DATA if you do not want to refresh the continuous aggregate on creation.
+CREATE VIEW see_cagg AS SELECT * FROM conditions_7 WHERE bucket <= 70 ORDER BY bucket;
+SELECT * FROM see_cagg;
+ bucket |  sum  | count 
+--------+-------+-------
+      0 | 21.98 |     7
+      7 | 21.98 |     7
+     14 | 21.98 |     7
+     21 | 21.98 |     7
+     28 | 21.98 |     7
+     35 | 21.98 |     7
+     42 | 21.98 |     7
+     49 | 21.98 |     7
+     56 | 21.98 |     7
+     63 | 21.98 |     7
+     70 | 21.98 |     7
+(11 rows)
+
+-- This is the simplest case, when the updated bucket is inside a chunk, so it is expected
+-- that the update is refreshed.
+UPDATE conditions SET value = 4.00 WHERE time_int = 2;
+-- This case updates values in the bucket, which affects two different partials in
+-- two different chunks.
+UPDATE conditions SET value = 4.00 WHERE time_int = 9;
+UPDATE conditions SET value = 4.00 WHERE time_int = 11;
+SELECT _timescaledb_internal.refresh_continuous_aggregate('conditions_7', show_chunks('conditions', 20));
+ refresh_continuous_aggregate 
+------------------------------
+ 
+ 
+(2 rows)
+
+SELECT drop_chunks('conditions', 20);
+               drop_chunks               
+-----------------------------------------
+ _timescaledb_internal._hyper_3_65_chunk
+ _timescaledb_internal._hyper_3_66_chunk
+(2 rows)
+
+SELECT * FROM see_cagg;
+ bucket |  sum  | count 
+--------+-------+-------
+      0 | 22.84 |     7
+      7 |  23.7 |     7
+     14 | 21.98 |     7
+     21 | 21.98 |     7
+     28 | 21.98 |     7
+     35 | 21.98 |     7
+     42 | 21.98 |     7
+     49 | 21.98 |     7
+     56 | 21.98 |     7
+     63 | 21.98 |     7
+     70 | 21.98 |     7
+(11 rows)
+
+-- This case is an update at the beginning of a bucket, which crosses two chunks. The update 
+-- is in the first chunk, which is going to be refreshed, and the update will be present.
+UPDATE conditions SET value = 4.00 WHERE time_int = 39;
+-- This update is in the bucket, which crosses two chunks. The first chunk is going to be 
+-- refreshed now and the update is outside it, and thus should not be reflected. The second 
+-- chunk contains the update and will be refreshed on the next call, thus it should be reflected 
+-- in the continuous aggregate only after another refresh.
+UPDATE conditions SET value = 4.00 WHERE time_int = 41;
+-- After the call to drop_chunks the update in 39 will be refreshed and present in the cagg, 
+-- but not the update in 41.
+BEGIN;
+    SELECT _timescaledb_internal.refresh_continuous_aggregate('conditions_7', show_chunks('conditions', 40));
+ refresh_continuous_aggregate 
+------------------------------
+ 
+ 
+(2 rows)
+
+    SELECT drop_chunks('conditions', 40);
+               drop_chunks               
+-----------------------------------------
+ _timescaledb_internal._hyper_3_67_chunk
+ _timescaledb_internal._hyper_3_68_chunk
+(2 rows)
+
+END;
+SELECT * FROM see_cagg;
+ bucket |  sum  | count 
+--------+-------+-------
+      0 | 22.84 |     7
+      7 |  23.7 |     7
+     14 | 21.98 |     7
+     21 | 21.98 |     7
+     28 | 21.98 |     7
+     35 | 22.84 |     7
+     42 | 21.98 |     7
+     49 | 21.98 |     7
+     56 | 21.98 |     7
+     63 | 21.98 |     7
+     70 | 21.98 |     7
+(11 rows)
+
+-- Now refresh includes the update in 41.
+SELECT _timescaledb_internal.refresh_continuous_aggregate('conditions_7', show_chunks('conditions', 60));
+ refresh_continuous_aggregate 
+------------------------------
+ 
+ 
+(2 rows)
+
+SELECT drop_chunks('conditions', 60);
+               drop_chunks               
+-----------------------------------------
+ _timescaledb_internal._hyper_3_69_chunk
+ _timescaledb_internal._hyper_3_70_chunk
+(2 rows)
+
+SELECT * FROM see_cagg;
+ bucket |  sum  | count 
+--------+-------+-------
+      0 | 22.84 |     7
+      7 |  23.7 |     7
+     14 | 21.98 |     7
+     21 | 21.98 |     7
+     28 | 21.98 |     7
+     35 |  23.7 |     7
+     42 | 21.98 |     7
+     49 | 21.98 |     7
+     56 | 21.98 |     7
+     63 | 21.98 |     7
+     70 | 21.98 |     7
+(11 rows)
+
+-- Update chunks before drop but don't refresh, so the update will not be reflected in the cagg.
+UPDATE conditions SET value = 4.00 WHERE time_int = 62;
+UPDATE conditions SET value = 4.00 WHERE time_int = 69;
+SELECT drop_chunks('conditions', 80);
+               drop_chunks               
+-----------------------------------------
+ _timescaledb_internal._hyper_3_71_chunk
+ _timescaledb_internal._hyper_3_72_chunk
+(2 rows)
+
+SELECT * FROM see_cagg;
+ bucket |  sum  | count 
+--------+-------+-------
+      0 | 22.84 |     7
+      7 |  23.7 |     7
+     14 | 21.98 |     7
+     21 | 21.98 |     7
+     28 | 21.98 |     7
+     35 |  23.7 |     7
+     42 | 21.98 |     7
+     49 | 21.98 |     7
+     56 | 21.98 |     7
+     63 | 21.98 |     7
+     70 | 21.98 |     7
+(11 rows)
 

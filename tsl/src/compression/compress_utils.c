@@ -8,6 +8,7 @@
  *  compress and decompress chunks
  */
 #include <postgres.h>
+#include <access/xact.h>
 #include <catalog/dependency.h>
 #include <commands/tablecmds.h>
 #include <commands/trigger.h>
@@ -36,7 +37,6 @@
 #include "compat.h"
 #include "scanner.h"
 #include "scan_iterator.h"
-#include "license.h"
 #include "compression_chunk_size.h"
 
 #define CHUNK_DML_BLOCKER_TRIGGER "chunk_dml_blocker"
@@ -184,14 +184,16 @@ compresschunkcxt_init(CompressChunkCxt *cxt, Cache *hcache, Oid hypertable_relid
 	Chunk *srcchunk;
 
 	ts_hypertable_permissions_check(srcht->main_table_relid, GetUserId());
-	if (!TS_HYPERTABLE_HAS_COMPRESSION(srcht))
-	{
+
+	if (!TS_HYPERTABLE_HAS_COMPRESSION_TABLE(srcht))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("chunks can be compressed only if compression property is set on the "
-						"hypertable"),
-				 errhint("Use ALTER TABLE with timescaledb.compress option.")));
-	}
+				 errmsg("compression not enabled on \"%s\"", NameStr(srcht->fd.table_name)),
+				 errdetail("It is not possible to compress chunks on a hypertable"
+						   " that does not have compression enabled."),
+				 errhint("Enable compression using ALTER TABLE with"
+						 " the timescaledb.compress option.")));
+
 	compress_ht = ts_hypertable_get_by_id(srcht->fd.compressed_hypertable_id);
 	if (compress_ht == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("missing compress hypertable")));
@@ -239,6 +241,7 @@ preserve_uncompressed_chunk_stats(Oid chunk_relid)
 	ExecVacuum(NULL, &vs, true);
 #else
 	ExecVacuum(&vs, true);
+	CommandCounterIncrement();
 #endif
 	AlterTableInternal(chunk_relid, list_make1(&at_cmd), false);
 }

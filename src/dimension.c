@@ -5,6 +5,7 @@
  */
 #include <postgres.h>
 #include <catalog/pg_type.h>
+#include <catalog/namespace.h>
 #include <access/relscan.h>
 #include <commands/tablecmds.h>
 #include <utils/lsyscache.h>
@@ -26,8 +27,22 @@
 #include "hypertable_cache.h"
 #include "partitioning.h"
 #include "scanner.h"
+#include "time_utils.h"
 #include "utils.h"
 #include "errors.h"
+
+/* add_dimension record attribute numbers */
+enum Anum_add_dimension
+{
+	Anum_add_dimension_id = 1,
+	Anum_add_dimension_schema_name,
+	Anum_add_dimension_table_name,
+	Anum_add_dimension_column_name,
+	Anum_add_dimension_created,
+	_Anum_add_dimension_max,
+};
+
+#define Natts_add_dimension (_Anum_add_dimension_max - 1)
 
 static int
 cmp_dimension_id(const void *left, const void *right)
@@ -214,37 +229,34 @@ create_range_datum(FunctionCallInfo fcinfo, DimensionSlice *slice)
 }
 
 static DimensionSlice *
-calculate_open_range_default(Dimension *dim, int64 value)
+calculate_open_range_default(const Dimension *dim, int64 value)
 {
 	int64 range_start, range_end;
+	Oid dimtype = ts_dimension_get_partition_type(dim);
 
 	if (value < 0)
 	{
+		const int64 dim_min = ts_time_get_min(dimtype);
+
 		range_end = ((value + 1) / dim->fd.interval_length) * dim->fd.interval_length;
 
 		/* prevent integer underflow */
-		if (DIMENSION_SLICE_MINVALUE - range_end > -dim->fd.interval_length)
-		{
+		if (dim_min - range_end > -dim->fd.interval_length)
 			range_start = DIMENSION_SLICE_MINVALUE;
-		}
 		else
-		{
 			range_start = range_end - dim->fd.interval_length;
-		}
 	}
 	else
 	{
+		const int64 dim_end = ts_time_get_max(dimtype);
+
 		range_start = (value / dim->fd.interval_length) * dim->fd.interval_length;
 
 		/* prevent integer overflow */
-		if (DIMENSION_SLICE_MAXVALUE - range_start < dim->fd.interval_length)
-		{
+		if (dim_end - range_start < dim->fd.interval_length)
 			range_end = DIMENSION_SLICE_MAXVALUE;
-		}
 		else
-		{
 			range_end = range_start + dim->fd.interval_length;
-		}
 	}
 
 	return ts_dimension_slice_create(dim->fd.id, range_start, range_end);
@@ -263,6 +275,7 @@ ts_dimension_calculate_open_range_default(PG_FUNCTION_ARGS)
 		.type = DIMENSION_TYPE_OPEN,
 		.fd.id = 0,
 		.fd.interval_length = PG_GETARG_INT64(1),
+		.fd.column_type = TypenameGetTypid(PG_GETARG_CSTRING(2)),
 	};
 	DimensionSlice *slice = calculate_open_range_default(&dim, value);
 
@@ -798,8 +811,7 @@ ts_dimension_set_type(Dimension *dim, Oid newtype)
 						NameStr(dim->fd.column_name),
 						format_type_be(dim->fd.column_type),
 						format_type_be(newtype)),
-				 errdetail("time dimension of hypertable can only have types: TIMESTAMP, "
-						   "TIMESTAMPTZ, and DATE")));
+				 errhint("Use an integer, timestamp, or date type.")));
 
 	dim->fd.column_type = newtype;
 
@@ -905,7 +917,7 @@ ts_hyperspace_calculate_point(Hyperspace *hs, TupleTableSlot *slot)
 							(errcode(ERRCODE_NOT_NULL_VIOLATION),
 							 errmsg("NULL value in column \"%s\" violates not-null constraint",
 									NameStr(d->fd.column_name)),
-							 errhint("Columns used for time partitioning cannot be NULL")));
+							 errhint("Columns used for time partitioning cannot be NULL.")));
 
 				p->coordinates[p->num_coords++] = ts_time_value_to_internal(datum, dimtype);
 				break;
@@ -947,7 +959,7 @@ get_validated_integer_interval(Oid dimtype, int64 value)
 		ereport(WARNING,
 				(errcode(ERRCODE_AMBIGUOUS_PARAMETER),
 				 errmsg("unexpected interval: smaller than one second"),
-				 errhint("The interval is specified in microseconds")));
+				 errhint("The interval is specified in microseconds.")));
 
 	return value;
 }
@@ -961,8 +973,8 @@ dimension_interval_to_internal(const char *colname, Oid dimtype, Oid valuetype, 
 	if (!IS_VALID_OPEN_DIM_TYPE(dimtype))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("invalid dimension type: \"%s\" must be an integer, date or timestamp",
-						colname)));
+				 errmsg("invalid type for dimension \"%s\"", colname),
+				 errhint("Use an integer, timestamp, or date type.")));
 
 	if (!OidIsValid(valuetype))
 	{
@@ -988,24 +1000,28 @@ dimension_interval_to_internal(const char *colname, Oid dimtype, Oid valuetype, 
 			interval = get_validated_integer_interval(dimtype, DatumGetInt64(value));
 			break;
 		case INTERVALOID:
-			if (IS_INTEGER_TYPE(dimtype))
+			if (!IS_TIMESTAMP_TYPE(dimtype))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg(
-							 "invalid interval: must be an integer type for integer dimensions")));
+						 errmsg("invalid interval type for %s dimension", format_type_be(dimtype)),
+						 errhint("Use an interval of type integer.")));
 
 			interval = interval_to_usec(DatumGetIntervalP(value));
 			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid interval: must be an interval or integer type")));
+					 errmsg("invalid interval type for %s dimension", format_type_be(dimtype)),
+					 IS_TIMESTAMP_TYPE(dimtype) ?
+						 errhint("Use an interval of type integer or interval.") :
+						 errhint("Use an interval of type integer.")));
 	}
 
 	if (dimtype == DATEOID && (interval <= 0 || interval % USECS_PER_DAY != 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid interval: must be multiples of one day")));
+				 errmsg("invalid interval for %s dimension", format_type_be(dimtype)),
+				 errhint("Use an interval that is a multiple of one day.")));
 
 	return interval;
 }
@@ -1037,7 +1053,7 @@ dimension_add_not_null_on_column(Oid table_relid, char *colname)
 
 	ereport(NOTICE,
 			(errmsg("adding not-null constraint to column \"%s\"", colname),
-			 errdetail("Time dimensions cannot have NULL values")));
+			 errdetail("Time dimensions cannot have NULL values.")));
 
 	AlterTableInternal(table_relid, list_make1(&cmd), false);
 }
@@ -1063,7 +1079,7 @@ ts_dimension_update(Hypertable *ht, Name dimname, DimensionType dimtype, Datum *
 					 errmsg("hypertable \"%s\" has multiple %s dimensions",
 							get_rel_name(ht->main_table_relid),
 							dimtype == DIMENSION_TYPE_OPEN ? "time" : "space"),
-					 errhint("An explicit dimension name needs to be specified")));
+					 errhint("An explicit dimension name must be specified.")));
 
 		dim = ts_hyperspace_get_dimension(ht->space, dimtype, 0);
 	}
@@ -1129,12 +1145,11 @@ ts_dimension_set_num_slices(PG_FUNCTION_ARGS)
 	int16 num_slices;
 	Hypertable *ht;
 
-	PreventCommandIfReadOnly("set_number_partitions()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid hypertable name: cannot be NULL")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("hypertable cannot be NULL")));
 
 	/* Verify that we're dealing with a hypertable or fail */
 	ht = ts_hypertable_cache_get_entry(hcache, table_relid, CACHE_FLAG_NONE);
@@ -1164,7 +1179,7 @@ TS_FUNCTION_INFO_V1(ts_dimension_set_interval);
 /*
  * Update chunk_time_interval for a hypertable.
  *
- * main_table - The OID of the table corresponding to a hypertable whose time
+ * hypertable - The OID of the table corresponding to a hypertable whose time
  *     interval should be updated
  * chunk_time_interval - The new time interval. For hypertables with integral
  *     time columns, this must be an integral type. For hypertables with a
@@ -1182,12 +1197,11 @@ ts_dimension_set_interval(PG_FUNCTION_ARGS)
 	Cache *hcache = ts_hypertable_cache_pin();
 	Hypertable *ht;
 
-	PreventCommandIfReadOnly("set_chunk_time_interval()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid main_table: cannot be NULL")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("hypertable cannot be NULL")));
 
 	ht = ts_hypertable_cache_get_entry(hcache, table_relid, CACHE_FLAG_NONE);
 	ts_hypertable_permissions_check(table_relid, GetUserId());
@@ -1461,12 +1475,11 @@ ts_dimension_add(PG_FUNCTION_ARGS)
 	};
 	Datum retval = 0;
 
-	PreventCommandIfReadOnly("add_dimension()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid main_table: cannot be NULL")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("hypertable cannot be NULL")));
 
 	if (!info.num_slices_is_set && !OidIsValid(info.interval_type))
 		ereport(ERROR,

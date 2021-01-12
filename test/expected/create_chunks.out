@@ -135,7 +135,7 @@ INSERT INTO chunk_test_ends VALUES (9223372036854775807::bigint, 24.2, 11233, 1)
 INSERT INTO chunk_test_ends VALUES (9223372036854775807::bigint, 24.3, 11233, 1), (9223372036854775807::bigint, 24.4, 11233, 1);
 INSERT INTO chunk_test_ends VALUES ((-9223372036854775808)::bigint, 23.2, 11233, 1);
 INSERT INTO chunk_test_ends VALUES ((-9223372036854775808)::bigint, 23.3, 11233, 1), ((-9223372036854775808)::bigint, 23.4, 11233, 1);
-SELECT * FROM chunk_test_ends ORDER BY time asc, tag;
+SELECT * FROM chunk_test_ends ORDER BY time asc, tag, temp;
          time         | temp |  tag  | color 
 ----------------------+------+-------+-------
  -9223372036854775808 | 23.1 | 11233 |     1
@@ -207,13 +207,13 @@ ORDER BY d.id;
 
 \set ON_ERROR_STOP 0
 select set_chunk_time_interval(NULL,NULL::interval);
-ERROR:  invalid main_table: cannot be NULL
+ERROR:  hypertable cannot be NULL
 -- should fail since time column is an int
 SELECT set_chunk_time_interval('chunk_test', INTERVAL '1 minute');
-ERROR:  invalid interval: must be an integer type for integer dimensions
+ERROR:  invalid interval type for integer dimension
 -- should fail since its not a valid way to represent time
 SELECT set_chunk_time_interval('chunk_test', 'foo'::TEXT);
-ERROR:  invalid interval: must be an interval or integer type
+ERROR:  invalid interval type for integer dimension
 SELECT set_chunk_time_interval('chunk_test', NULL::BIGINT);
 ERROR:  invalid interval: an explicit interval must be specified
 SELECT set_chunk_time_interval('chunk_test2', NULL::BIGINT);

@@ -38,14 +38,7 @@ typedef struct CopyChunkState CopyChunkState;
 
 typedef struct CrossModuleFunctions
 {
-	void (*tsl_license_on_assign)(const char *newval, const void *license);
-	bool (*enterprise_enabled_internal)(void);
-	bool (*check_tsl_loaded)(void);
-	TimestampTz (*license_end_time)(void);
-	void (*print_tsl_license_expiration_info_hook)(void);
-	void (*module_shutdown_hook)(void);
 	void (*add_tsl_telemetry_info)(JsonbParseState **parse_state);
-	bool (*continuous_agg_materialize)(int32 materialization_id, ContinuousAggMatOptions *options);
 
 	PGFunction policy_compression_add;
 	PGFunction policy_compression_proc;
@@ -94,6 +87,7 @@ typedef struct CrossModuleFunctions
 									   WithClauseResult *with_clause_options);
 	PGFunction continuous_agg_invalidation_trigger;
 	PGFunction continuous_agg_refresh;
+	PGFunction continuous_agg_refresh_chunk;
 	void (*continuous_agg_invalidate)(const Hypertable *ht, int64 start, int64 end);
 	void (*continuous_agg_update_options)(ContinuousAgg *cagg,
 										  WithClauseResult *with_clause_options);
@@ -145,8 +139,7 @@ typedef struct CrossModuleFunctions
 	void (*create_chunk_on_data_nodes)(Chunk *chunk, Hypertable *ht);
 	Path *(*data_node_dispatch_path_create)(PlannerInfo *root, ModifyTablePath *mtpath,
 											Index hypertable_rti, int subpath_index);
-	void (*distributed_copy)(const CopyStmt *stmt, uint64 *processed, CopyChunkState *ccstate,
-							 List *attnums);
+	uint64 (*distributed_copy)(const CopyStmt *stmt, CopyChunkState *ccstate, List *attnums);
 	bool (*set_distributed_id)(Datum id);
 	void (*set_distributed_peer_id)(Datum id);
 	bool (*is_frontend_session)(void);
@@ -161,6 +154,7 @@ typedef struct CrossModuleFunctions
 	PGFunction chunk_get_relstats;
 	PGFunction chunk_get_colstats;
 	PGFunction hypertable_distributed_set_replication_factor;
+	void (*update_compressed_chunk_relstats)(Oid uncompressed_relid, Oid compressed_relid);
 } CrossModuleFunctions;
 
 extern TSDLLEXPORT CrossModuleFunctions *ts_cm_functions;

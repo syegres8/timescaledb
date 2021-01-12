@@ -183,3 +183,97 @@ GRANT UPDATE ON _timescaledb_internal._hyper_3_35_chunk TO PUBLIC;
 \z _timescaledb_internal._hyper_3_35_chunk
 REVOKE SELECT ON _timescaledb_internal._hyper_3_35_chunk FROM PUBLIC;
 \z _timescaledb_internal._hyper_3_35_chunk
+
+DROP TABLE conditions;
+
+-- Test that we can create a writer role, assign users to that role,
+-- and allow the users to insert data and create new chunks.
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
+
+CREATE TABLE conditions(
+       time timestamptz,
+       device int CHECK (device > 0),
+       temp float,
+       PRIMARY KEY (time,device)
+);
+
+SELECT * FROM create_distributed_hypertable('conditions', 'time', 'device', 3);
+
+-- Test that we can create a writer role, assign users to that role,
+-- and allow the users to insert data and create new chunks.
+
+SET ROLE :ROLE_DEFAULT_PERM_USER_2;
+\set ON_ERROR_STOP 0
+INSERT INTO conditions
+SELECT time, 1 + (random()*30)::int, random()*80
+FROM generate_series('2019-01-01 00:00:00'::timestamptz, '2019-02-01 00:00:00', '1 min') AS time;
+\set ON_ERROR_STOP 1
+
+RESET ROLE;
+GRANT INSERT ON conditions TO :ROLE_DEFAULT_PERM_USER_2;
+
+SET ROLE :ROLE_DEFAULT_PERM_USER_2;
+INSERT INTO conditions
+SELECT time, 1 + (random()*30)::int, random()*80
+FROM generate_series('2019-01-01 00:00:00'::timestamptz, '2019-02-01 00:00:00', '1 min') AS time;
+
+RESET ROLE;
+SELECT current_user;
+
+-- Test GRANT on foreign server and data node authentication using a
+-- user mapping
+SET ROLE :ROLE_3;
+SELECT current_user;
+CREATE TABLE disttable_role_3(time timestamptz, device int, temp float);
+
+\set ON_ERROR_STOP 0
+-- Can't create distributed hypertable without GRANTs on foreign servers (data nodes)
+SELECT * FROM create_distributed_hypertable('disttable_role_3', 'time', data_nodes => '{"data1", "data2"}');
+\set ON_ERROR_STOP 1
+
+-- Grant USAGE on data1 (but it is not enough)
+RESET ROLE;
+GRANT USAGE ON FOREIGN SERVER data1 TO :ROLE_3;
+SET ROLE :ROLE_3;
+
+\set ON_ERROR_STOP 0
+SELECT * FROM create_distributed_hypertable('disttable_role_3', 'time', data_nodes => '{"data1", "data2"}');
+\set ON_ERROR_STOP 1
+
+-- Creating the hypertable should work with GRANTs on both servers.
+RESET ROLE;
+GRANT USAGE ON FOREIGN SERVER data2 TO :ROLE_3;
+SET ROLE :ROLE_3;
+
+\set ON_ERROR_STOP 0
+-- Still cannot connect since there is no password in the passfile and
+-- no user mapping.
+SELECT * FROM create_distributed_hypertable('disttable_role_3', 'time', data_nodes => '{"data1", "data2"}');
+\set ON_ERROR_STOP 1
+
+RESET ROLE;
+CREATE USER MAPPING FOR :ROLE_3 SERVER data1 OPTIONS (user :'ROLE_3', password :'ROLE_3_PASS');
+SET ROLE :ROLE_3;
+
+\set ON_ERROR_STOP 0
+-- Still cannot connect since there is only a user mapping for data
+-- node "data1".
+SELECT * FROM create_distributed_hypertable('disttable_role_3', 'time', data_nodes => '{"data1", "data2"}');
+\set ON_ERROR_STOP 1
+
+RESET ROLE;
+-- Create user mapping for ROLE_3, but don't specify user in
+-- options. The "current user" will instead be used when connecting.
+CREATE USER MAPPING FOR :ROLE_3 SERVER data2 OPTIONS (password :'ROLE_3_PASS');
+SET ROLE :ROLE_3;
+
+-- User should be able to connect and create the distributed
+-- hypertable at this point.
+SELECT * FROM create_distributed_hypertable('disttable_role_3', 'time', data_nodes => '{"data1", "data2"}');
+
+-- Test insert and query
+INSERT INTO disttable_role_3 VALUES ('2019-01-01 00:00:00', 1, 23.4);
+SELECT * FROM disttable_role_3;
+
+DROP USER MAPPING FOR :ROLE_3 SERVER data1;
+DROP USER MAPPING FOR :ROLE_3 SERVER data2;

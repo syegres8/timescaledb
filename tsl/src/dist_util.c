@@ -130,8 +130,8 @@ dist_util_set_id_with_uuid_check(Datum dist_id, bool check_uuid)
 				 (errmsg("cannot add the current database as a data node to itself"),
 				  errdetail("Adding the current database as a data node to itself would create a "
 							"cycle. Use a different instance or database for the data node."),
-				  errhint("Check that the 'port' parameter is given and refer to a different "
-						  "instance or that the 'database' parameter is given and refer to a "
+				  errhint("Check that the 'port' parameter refers to a different "
+						  "instance or that the 'database' parameter refers to a "
 						  "different database."))));
 
 	ts_metadata_insert(CStringGetDatum(METADATA_DISTRIBUTED_UUID_KEY_NAME),
@@ -340,6 +340,7 @@ dist_util_is_compatible_version(const char *data_node_version, const char *acces
 	unsigned int access_node_major, access_node_minor, access_node_patch;
 
 	Assert(is_old_version);
+	Assert(data_node_version);
 
 	if (sscanf(data_node_version,
 			   "%u.%u.%u",

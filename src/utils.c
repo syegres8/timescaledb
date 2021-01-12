@@ -33,6 +33,7 @@
 #include "compat.h"
 #include "chunk.h"
 #include "utils.h"
+#include "time_utils.h"
 #include "guc.h"
 
 TS_FUNCTION_INFO_V1(ts_pg_timestamp_to_unix_microseconds);
@@ -46,10 +47,10 @@ ts_pg_timestamp_to_unix_microseconds(PG_FUNCTION_ARGS)
 	TimestampTz timestamp = PG_GETARG_TIMESTAMPTZ(0);
 
 	if (TIMESTAMP_IS_NOBEGIN(timestamp))
-		PG_RETURN_INT64(PG_INT64_MIN);
+		PG_RETURN_INT64(TS_TIME_NOBEGIN);
 
 	if (TIMESTAMP_IS_NOEND(timestamp))
-		PG_RETURN_INT64(PG_INT64_MAX);
+		PG_RETURN_INT64(TS_TIME_NOEND);
 
 	if (timestamp < TS_TIMESTAMP_MIN)
 		ereport(ERROR,
@@ -74,11 +75,11 @@ ts_pg_unix_microseconds_to_timestamp(PG_FUNCTION_ARGS)
 {
 	int64 microseconds = PG_GETARG_INT64(0);
 
-	if (microseconds == PG_INT64_MIN)
-		PG_RETURN_TIMESTAMPTZ(DT_NOBEGIN);
+	if (TS_TIME_IS_NOBEGIN(microseconds, TIMESTAMPTZOID))
+		PG_RETURN_DATUM(ts_time_datum_get_nobegin(TIMESTAMPTZOID));
 
-	if (microseconds == PG_INT64_MAX)
-		PG_RETURN_TIMESTAMPTZ(DT_NOEND);
+	if (TS_TIME_IS_NOEND(microseconds, TIMESTAMPTZOID))
+		PG_RETURN_DATUM(ts_time_datum_get_noend(TIMESTAMPTZOID));
 
 	/*
 	 * Test that the UNIX us timestamp is within bounds. Note that an int64 at
@@ -86,7 +87,7 @@ ts_pg_unix_microseconds_to_timestamp(PG_FUNCTION_ARGS)
 	 * of the supported date range (Julian end date), so INT64_MAX-1 is the
 	 * natural upper bound for this function.
 	 */
-	if (microseconds < TS_INTERNAL_TIMESTAMP_MIN)
+	if (microseconds < TS_TIMESTAMP_INTERNAL_MIN)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE), errmsg("timestamp out of range")));
 
@@ -99,11 +100,11 @@ ts_pg_unix_microseconds_to_date(PG_FUNCTION_ARGS)
 	int64 microseconds = PG_GETARG_INT64(0);
 	Datum res;
 
-	if (microseconds == PG_INT64_MIN)
-		PG_RETURN_DATEADT(DATEVAL_NOBEGIN);
+	if (TS_TIME_IS_NOBEGIN(microseconds, DATEOID))
+		PG_RETURN_DATUM(ts_time_datum_get_nobegin(DATEOID));
 
-	if (microseconds == PG_INT64_MAX)
-		PG_RETURN_DATEADT(DATEVAL_NOEND);
+	if (TS_TIME_IS_NOEND(microseconds, DATEOID))
+		PG_RETURN_DATUM(ts_time_datum_get_noend(DATEOID));
 
 	res = DirectFunctionCall1(ts_pg_unix_microseconds_to_timestamp, Int64GetDatum(microseconds));
 	res = DirectFunctionCall1(timestamp_date, res);
@@ -118,6 +119,34 @@ ts_time_value_to_internal(Datum time_val, Oid type_oid)
 {
 	Datum res, tz;
 
+	/* Handle custom time types. We currently only support binary coercible
+	 * types */
+	if (!IS_VALID_TIME_TYPE(type_oid))
+	{
+		if (ts_type_is_int8_binary_compatible(type_oid))
+			return DatumGetInt64(time_val);
+
+		elog(ERROR, "unknown time type OID %d", type_oid);
+	}
+
+	if (IS_INTEGER_TYPE(type_oid))
+	{
+		/* Integer time types have no distinction between min, max and
+		 * infinity. We don't want min and max to be turned into infinity for
+		 * these types so check for those values first. */
+		if (TS_TIME_DATUM_IS_MIN(time_val, type_oid))
+			return ts_time_get_min(type_oid);
+
+		if (TS_TIME_DATUM_IS_MAX(time_val, type_oid))
+			return ts_time_get_max(type_oid);
+	}
+
+	if (TS_TIME_DATUM_IS_NOBEGIN(time_val, type_oid))
+		return ts_time_get_nobegin(type_oid);
+
+	if (TS_TIME_DATUM_IS_NOEND(time_val, type_oid))
+		return ts_time_get_noend(type_oid);
+
 	switch (type_oid)
 	{
 		case INT8OID:
@@ -125,7 +154,6 @@ ts_time_value_to_internal(Datum time_val, Oid type_oid)
 		case INT2OID:
 			return ts_integer_to_internal(time_val, type_oid);
 		case TIMESTAMPOID:
-
 			/*
 			 * for timestamps, ignore timezones, make believe the timestamp is
 			 * at UTC
@@ -143,9 +171,6 @@ ts_time_value_to_internal(Datum time_val, Oid type_oid)
 
 			return DatumGetInt64(res);
 		default:
-			if (ts_type_is_int8_binary_compatible(type_oid))
-				return DatumGetInt64(time_val);
-
 			elog(ERROR, "unknown time type OID %d", type_oid);
 			return -1;
 	}
@@ -288,6 +313,12 @@ static Datum ts_integer_to_internal_value(int64 value, Oid type);
 TSDLLEXPORT Datum
 ts_internal_to_time_value(int64 value, Oid type)
 {
+	if (TS_TIME_IS_NOBEGIN(value, type))
+		return ts_time_datum_get_nobegin(type);
+
+	if (TS_TIME_IS_NOEND(value, type))
+		return ts_time_datum_get_noend(type);
+
 	switch (type)
 	{
 		case INT2OID:
@@ -676,6 +707,13 @@ ts_get_appendrelinfo(PlannerInfo *root, Index rti, bool missing_ok)
 	return NULL;
 }
 
+/*
+ * Find an equivalence class member expression, all of whose Vars, come from
+ * the indicated relation.
+ *
+ * This function has been copied from find_em_expr_for_rel in
+ * contrib/postgres_fdw/postgres_fdw.c in postgres source.
+ */
 Expr *
 ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 {
@@ -742,42 +780,6 @@ ts_get_reloptions(Oid relid)
 	ReleaseSysCache(tuple);
 
 	return options;
-}
-
-int64
-ts_get_now_internal(const Dimension *open_dim)
-{
-	Oid dim_post_part_type = ts_dimension_get_partition_type(open_dim);
-
-	if (IS_INTEGER_TYPE(dim_post_part_type))
-	{
-		Datum now_datum;
-		Oid now_func = ts_get_integer_now_func(open_dim);
-		now_datum = OidFunctionCall0(now_func);
-		return ts_time_value_to_internal(now_datum, dim_post_part_type);
-	}
-#ifdef TS_DEBUG
-	Datum now_datum;
-	if (ts_current_timestamp_mock == NULL || strlen(ts_current_timestamp_mock) == 0)
-		now_datum = TimestampTzGetDatum(GetCurrentTransactionStartTimestamp());
-	else
-		now_datum = DirectFunctionCall3(timestamptz_in,
-										CStringGetDatum(ts_current_timestamp_mock),
-										0,
-										Int32GetDatum(-1));
-#else
-	Datum now_datum = TimestampTzGetDatum(GetCurrentTransactionStartTimestamp());
-#endif
-	Assert(IS_TIMESTAMP_TYPE(dim_post_part_type));
-
-	/*
-	 * If the type of the partitioning column is TIMESTAMP or DATE
-	 * we need to adjust the return value for the local timezone.
-	 */
-	if (dim_post_part_type == TIMESTAMPOID || dim_post_part_type == DATEOID)
-		now_datum = DirectFunctionCall1(timestamptz_timestamp, now_datum);
-
-	return ts_time_value_to_internal(now_datum, TIMESTAMPTZOID);
 }
 
 /*

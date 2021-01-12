@@ -30,7 +30,7 @@ endfunction()
 
 configure_file("version.config" "version.config" COPYONLY)
 file(READ version.config VERSION_CONFIG)
-set(VERSION_REGEX "version[\t ]*=[\t ]*([0-9]+\\.[0-9]+\\.*[0-9]*)([-]([a-z]+[0-9]*))?([-](dev))?\r?\nupdate_from_version[\t ]*=[\t ]*([0-9]+\\.[0-9]+\\.*[0-9]*)([-]([a-z]+[0-9]*))*(\r?\n)*$")
+set(VERSION_REGEX "version[\t ]*=[\t ]*([0-9]+\\.[0-9]+\\.*[0-9]*)([-]([a-z]+[0-9]*))?([-](dev))?\r?\nupdate_from_version[\t ]*=[\t ]*([0-9]+\\.[0-9]+\\.*[0-9]*([-]([a-z]+[0-9]*))?)*(\r?\n)*$")
 
 if (NOT (${VERSION_CONFIG} MATCHES ${VERSION_REGEX}))
   message(FATAL_ERROR "Cannot read version from version.config")
@@ -113,12 +113,26 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|AppleClang|Clang")
   #
   # -Wconversions
 
-  add_compile_options(-Wempty-body -Wvla)
-  check_c_compiler_flag(-Wimplicit-fallthrough CC_SUPPORTS_IMPLICIT_FALLTHROUGH)
+  # These flags are supported on all compilers.
+  add_compile_options(
+    -Wempty-body -Wvla -Wall -Wmissing-prototypes -Wpointer-arith
+    -Werror=vla -Wendif-labels -fno-strict-aliasing -fno-omit-frame-pointer)
 
-  if (CC_SUPPORTS_IMPLICIT_FALLTHROUGH)
-    add_compile_options(-Wimplicit-fallthrough)
-  endif ()
+  # These flags are just supported on some of the compilers, so we
+  # check them before adding them.
+  check_c_compiler_flag(-Wno-format-truncation CC_SUPPORTS_NO_FORMAT_TRUNCATION)
+  if(CC_SUPPORTS_NO_FORMAT_TRUNCATION)
+    add_compile_options(-Wno-format-truncation)
+  else()
+    message(STATUS "Compiler does not support -Wno-format-truncation")
+  endif()
+
+  check_c_compiler_flag(-Wimplicit-fallthrough CC_SUPPORTS_IMPLICIT_FALLTHROUGH)
+  if(CC_SUPPORTS_IMPLICIT_FALLTHROUGH)
+    add_compile_options( -Wimplicit-fallthrough)
+  else()
+    message(STATUS "Compiler does not support -Wimplicit-fallthrough")
+  endif()
 
   # On UNIX, the compiler needs to support -fvisibility=hidden to hide symbols by default
   check_c_compiler_flag(-fvisibility=hidden CC_SUPPORTS_VISIBILITY_HIDDEN)
@@ -166,6 +180,39 @@ endif ()
 
 find_package(Git)
 
+if(GIT_FOUND)
+  # We use "git describe" to generate the tag. It will find the latest
+  # tag and also add some additional information if we are not on the
+  # tag.
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} describe --dirty --always --tags
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE EXT_GIT_COMMIT_TAG
+    RESULT_VARIABLE _describe_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  # Fetch the commit HASH of head (short version) using rev-parse
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE EXT_GIT_COMMIT_HASH
+    RESULT_VARIABLE _revparse_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  # Fetch the date of the head commit
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} log -1 --format=%aI
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE EXT_GIT_COMMIT_TIME
+    RESULT_VARIABLE _log_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  # Results are non-zero if there were an error
+  if(_describe_RESULT OR _revparse_RESULT OR _log_RESULT)
+    message(STATUS "Unable to get git commit information")
+  endif()
+endif()
+
 message(STATUS "Using pg_config ${PG_CONFIG}")
 
 # Check PostgreSQL version
@@ -174,27 +221,25 @@ execute_process(
   OUTPUT_VARIABLE PG_VERSION_STRING
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-if (NOT ${PG_VERSION_STRING} MATCHES "^PostgreSQL[ ]+([0-9]+)\\.([0-9]+)(\\.([0-9]+))*")
+if (NOT ${PG_VERSION_STRING} MATCHES "^PostgreSQL[ ]+([0-9]+)(\\.([0-9]+)|devel|rc[0-9]+)")
   message(FATAL_ERROR "Could not parse PostgreSQL version ${PG_VERSION_STRING}")
 endif ()
 
 set(PG_VERSION_MAJOR ${CMAKE_MATCH_1})
-set(PG_VERSION_MINOR ${CMAKE_MATCH_2})
-set(PG_VERSION_PATCH ${CMAKE_MATCH_4})
-
-if (NOT ${PG_VERSION_PATCH} OR ${PG_VERSION_PATCH} EQUAL "")
-  set(PG_VERSION "${PG_VERSION_MAJOR}.${PG_VERSION_MINOR}")
-else ()
-  set(PG_VERSION "${PG_VERSION_MAJOR}.${PG_VERSION_MINOR}.${PG_VERSION_PATCH}")
+if (${CMAKE_MATCH_COUNT} GREATER "2" )
+  set(PG_VERSION_MINOR ${CMAKE_MATCH_3})
+else()
+  set(PG_VERSION_MINOR 0)
 endif ()
+set(PG_VERSION "${PG_VERSION_MAJOR}.${PG_VERSION_MINOR}")
 
 message(STATUS "Compiling against PostgreSQL version ${PG_VERSION}")
 
 # Ensure that PostgreSQL version is supported and consistent
 # with src/compat.h version check
 if ((${PG_VERSION_MAJOR} LESS "11") OR
-    (${PG_VERSION_MAJOR} GREATER "12"))
-  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 11 and 12")
+    (${PG_VERSION_MAJOR} GREATER "13"))
+  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 11, 12 and 13")
 endif()
 
 # Get PostgreSQL configuration from pg_config
@@ -205,7 +250,6 @@ get_pg_config(PG_PKGLIBDIR --pkglibdir)
 get_pg_config(PG_SHAREDIR --sharedir)
 get_pg_config(PG_BINDIR --bindir)
 get_pg_config(PG_CPPFLAGS --cppflags)
-get_pg_config(PG_CFLAGS --cflags)
 get_pg_config(PG_LDFLAGS --ldflags)
 get_pg_config(PG_LIBS --libs)
 
@@ -286,7 +330,7 @@ if (NOT CLANG_FORMAT)
 else()
   message(STATUS "Using local clang-format")
   add_custom_target(format
-    COMMAND ${PROJECT_SOURCE_DIR}/scripts/clang_format_all.sh
+    COMMAND ${CMAKE_COMMAND} -E env CLANG_FORMAT=${CLANG_FORMAT} ${PROJECT_SOURCE_DIR}/scripts/clang_format_all.sh
   )
 endif ()
 

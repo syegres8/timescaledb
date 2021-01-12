@@ -74,8 +74,10 @@
 #include "dimension.h"
 #include "continuous_agg.h"
 #include "options.h"
+#include "time_utils.h"
 #include "utils.h"
 #include "errors.h"
+#include "refresh.h"
 
 #define FINALFN "finalize_agg"
 #define PARTIALFN "partialize_agg"
@@ -181,7 +183,6 @@ typedef struct CAggTimebucketInfo
 	Oid htpartcoltype;
 	int64 htpartcol_interval_len; /* interval length setting for primary partitioning column */
 	int64 bucket_width;			  /*bucket_width of time_bucket */
-	Oid nowfunc;
 } CAggTimebucketInfo;
 
 typedef struct AggPartCxt
@@ -203,6 +204,10 @@ static int32 mattablecolumninfo_create_materialization_table(MatTableColumnInfo 
 															 int32 hypertable_id, RangeVar *mat_rel,
 															 CAggTimebucketInfo *origquery_tblinfo,
 															 bool create_addl_index,
+															 char *tablespacename,
+#if PG12_GE
+															 char *table_access_method,
+#endif
 															 ObjectAddress *mataddress);
 static Query *mattablecolumninfo_get_partial_select_query(MatTableColumnInfo *matcolinfo,
 														  Query *userview_query);
@@ -210,7 +215,7 @@ static Query *mattablecolumninfo_get_partial_select_query(MatTableColumnInfo *ma
 static void caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id,
 									Oid hypertable_oid, AttrNumber hypertable_partition_colno,
 									Oid hypertable_partition_coltype,
-									int64 hypertable_partition_col_interval, Oid now_func);
+									int64 hypertable_partition_col_interval);
 static void caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause,
 									List *targetList);
 static void finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query,
@@ -227,11 +232,10 @@ static Query *build_union_query(CAggTimebucketInfo *tbinfo, MatTableColumnInfo *
 
 /* create a entry for the materialization table in table CONTINUOUS_AGGS */
 static void
-create_cagg_catalog_entry(int32 matht_id, int32 rawht_id, char *user_schema, char *user_view,
-						  char *partial_schema, char *partial_view, int64 bucket_width,
-						  int64 refresh_lag, int64 max_interval_per_job,
-						  int64 ignore_invalidation_older_than, bool materialized_only,
-						  char *direct_schema, char *direct_view)
+create_cagg_catalog_entry(int32 matht_id, int32 rawht_id, const char *user_schema,
+						  const char *user_view, const char *partial_schema,
+						  const char *partial_view, int64 bucket_width, bool materialized_only,
+						  const char *direct_schema, const char *direct_view)
 {
 	Catalog *catalog = ts_catalog_get();
 	Relation rel;
@@ -262,15 +266,10 @@ create_cagg_catalog_entry(int32 matht_id, int32 rawht_id, char *user_schema, cha
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_partial_view_name)] =
 		NameGetDatum(&partial_viewnm);
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_bucket_width)] = Int64GetDatum(bucket_width);
-	values[AttrNumberGetAttrOffset(Anum_continuous_agg_refresh_lag)] = Int64GetDatum(refresh_lag);
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_direct_view_schema)] =
 		NameGetDatum(&direct_schnm);
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_direct_view_name)] =
 		NameGetDatum(&direct_viewnm);
-	values[AttrNumberGetAttrOffset(Anum_continuous_agg_max_interval_per_job)] =
-		Int64GetDatum(max_interval_per_job);
-	values[AttrNumberGetAttrOffset(Anum_continuous_agg_ignore_invalidation_older_than)] =
-		Int64GetDatum(ignore_invalidation_older_than);
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_materialize_only)] =
 		BoolGetDatum(materialized_only);
 
@@ -314,11 +313,9 @@ cagg_create_hypertable(int32 hypertable_id, Oid mat_tbloid, const char *matpartc
 											 HYPERTABLE_REGULAR,
 											 NULL);
 	if (!created)
-	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("continuous agg could not create hypertable for relid")));
-	}
+				 errmsg("could not create materialization hypertable")));
 }
 
 static bool
@@ -433,7 +430,7 @@ mattablecolumninfo_add_mattable_index(MatTableColumnInfo *matcolinfo, Hypertable
 		if (!HeapTupleIsValid(indxtuple))
 			elog(ERROR, "cache lookup failed for index relid %d", indxaddr.objectId);
 		indxname = ((Form_pg_class) GETSTRUCT(indxtuple))->relname;
-		elog(NOTICE,
+		elog(DEBUG1,
 			 "adding index %s ON %s.%s USING BTREE(%s, %s)",
 			 NameStr(indxname),
 			 NameStr(ht->fd.schema_name),
@@ -450,17 +447,26 @@ mattablecolumninfo_add_mattable_index(MatTableColumnInfo *matcolinfo, Hypertable
  * Reuse the information from ViewStmt:
  *   Remove the options on the into clause that we will not honour
  *   Modify the relname to ts_internal_<name>
+ *
  *  Parameters:
- *  mat_rel - relation information for the materialization table
- *  origquery_tblinfo - user query's tbale information. used for setting up thr partitioning of the
- * hypertable mataddress - return the ObjectAddress RETURNS: hypertable id of the materialization
- * table
+ *    mat_rel: relation information for the materialization table
+ *    origquery_tblinfo: - user query's tbale information. used for setting up
+ *        thr partitioning of the hypertable.
+ *    tablespace_name: Name of the tablespace for the materialization table.
+ *    table_access_method: Name of the table access method to use for the
+ *        materialization table.
+ *    mataddress: return the ObjectAddress RETURNS: hypertable id of the
+ *        materialization table
  */
 static int32
 mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, int32 hypertable_id,
 												RangeVar *mat_rel,
 												CAggTimebucketInfo *origquery_tblinfo,
-												bool create_addl_index, ObjectAddress *mataddress)
+												bool create_addl_index, char *const tablespacename,
+#if PG12_GE
+												char *const table_access_method,
+#endif
+												ObjectAddress *mataddress)
 {
 	Oid uid, saved_uid;
 	int sec_ctx;
@@ -472,9 +478,8 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 	int32 mat_htid;
 	Oid mat_relid;
 	Cache *hcache;
-	Hypertable *ht = NULL;
+	Hypertable *mat_ht = NULL;
 	Oid owner = GetUserId();
-	int64 current_time;
 
 	create = makeNode(CreateStmt);
 	create->relation = mat_rel;
@@ -484,7 +489,10 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 	create->constraints = NIL;
 	create->options = NULL;
 	create->oncommit = ONCOMMIT_NOOP;
-	create->tablespacename = NULL;
+	create->tablespacename = tablespacename;
+#if PG12_GE
+	create->accessMethod = table_access_method;
+#endif
 	create->if_not_exists = false;
 
 	/*  Create the materialization table.  */
@@ -505,24 +513,18 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 	cagg_create_hypertable(hypertable_id, mat_relid, matpartcolname, matpartcol_interval);
 
 	/* retrieve the hypertable id from the cache */
-	ht = ts_hypertable_cache_get_cache_and_entry(mat_relid, CACHE_FLAG_NONE, &hcache);
-	mat_htid = ht->fd.id;
+	mat_ht = ts_hypertable_cache_get_cache_and_entry(mat_relid, CACHE_FLAG_NONE, &hcache);
+	mat_htid = mat_ht->fd.id;
 
 	/* create additional index on the group-by columns for the materialization table */
 	if (create_addl_index)
-		mattablecolumninfo_add_mattable_index(matcolinfo, ht);
+		mattablecolumninfo_add_mattable_index(matcolinfo, mat_ht);
 
 	/* Initialize the invalidation log for the cagg. Initially, everything is
-	 * invalid. */
-	if (OidIsValid(origquery_tblinfo->nowfunc))
-		current_time = ts_time_value_to_internal(OidFunctionCall0(origquery_tblinfo->nowfunc),
-												 get_func_rettype(origquery_tblinfo->nowfunc));
-	else
-		current_time = GetCurrentTransactionStartTimestamp();
-
-	/* Add an infinite invalidation for the continuous aggregate. This is the
-	 * initial state of the aggregate before any refreshes. */
-	invalidation_cagg_log_add_entry(mat_htid, current_time, PG_INT64_MIN, PG_INT64_MAX);
+	 * invalid. Add an infinite invalidation for the continuous
+	 * aggregate. This is the initial state of the aggregate before any
+	 * refreshes. */
+	invalidation_cagg_log_add_entry(mat_htid, TS_TIME_NOBEGIN, TS_TIME_NOEND);
 
 	ts_cache_release(hcache);
 	return mat_htid;
@@ -597,7 +599,7 @@ create_view_for_query(Query *selquery, RangeVar *viewrel)
 static void
 caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id, Oid hypertable_oid,
 						AttrNumber hypertable_partition_colno, Oid hypertable_partition_coltype,
-						int64 hypertable_partition_col_interval, Oid nowfunc)
+						int64 hypertable_partition_col_interval)
 {
 	src->htid = hypertable_id;
 	src->htoid = hypertable_oid;
@@ -605,7 +607,6 @@ caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id, Oid hypert
 	src->htpartcoltype = hypertable_partition_coltype;
 	src->htpartcol_interval_len = hypertable_partition_col_interval;
 	src->bucket_width = 0; /*invalid value */
-	src->nowfunc = nowfunc;
 }
 
 /* Check if the group-by clauses has exactly 1 time_bucket(.., <col>)
@@ -623,71 +624,54 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 		if (IsA(tle->expr, FuncExpr))
 		{
 			FuncExpr *fe = ((FuncExpr *) tle->expr);
-			Const *width_arg;
+			Node *width_arg;
 			Node *col_arg;
 
 			if (!is_valid_bucketing_function(fe->funcid))
 				continue;
 
 			if (found)
-				elog(ERROR,
-					 "multiple time_bucket functions not permitted in continuous aggregate "
-					 "query");
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("continuous aggregate view cannot contain"
+								" multiple time bucket functions")));
 			else
 				found = true;
 
 			/*only column allowed : time_bucket('1day', <column> ) */
 			col_arg = lsecond(fe->args);
+
 			if (!(IsA(col_arg, Var)) || ((Var *) col_arg)->varattno != tbinfo->htpartcolno)
-				elog(ERROR,
-					 "time_bucket function for continuous aggregate query should be called "
-					 "on the dimension column of the hypertable ");
-			if (!IsA(linitial(fe->args), Const))
-			{
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("first argument to time_bucket function should be a constant for "
-								"continuous aggregate query")));
+						 errmsg(
+							 "time bucket function must reference a hypertable dimension column")));
+
+			/*
+			 * We constify width expression here so any immutable expression will be allowed
+			 * otherwise it would make it harder to create caggs for hypertables with e.g. int8
+			 * partitioning column as int constants default to int4 and so expression would
+			 * have a cast and not be a Const.
+			 */
+			width_arg = eval_const_expressions(NULL, linitial(fe->args));
+			if (IsA(width_arg, Const))
+			{
+				Const *width = castNode(Const, width_arg);
+
+				tbinfo->bucket_width =
+					ts_interval_value_to_internal(width->constvalue, width->consttype);
 			}
-			width_arg = (Const *) linitial(fe->args);
-			tbinfo->bucket_width =
-				ts_interval_value_to_internal(width_arg->constvalue, width_arg->consttype);
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("only immutable expressions allowed in time bucket function"),
+						 errhint("Use an immutable expression as first argument"
+								 " to the time bucket function.")));
 		}
 	}
+
 	if (!found)
-	{
-		elog(ERROR, "no valid bucketing function found for continuous aggregate query");
-	}
-}
-
-static int64
-get_refresh_lag(Oid column_type, int64 bucket_width, WithClauseResult *with_clause_options)
-{
-	if (with_clause_options[ContinuousViewOptionRefreshLag].is_default)
-		return bucket_width * 2;
-	return continuous_agg_parse_refresh_lag(column_type, with_clause_options);
-}
-
-static int64
-get_max_interval_per_job(Oid column_type, WithClauseResult *with_clause_options, int64 bucket_width)
-{
-	if (with_clause_options[ContinuousViewOptionMaxIntervalPerRun].is_default)
-	{
-		return (bucket_width < DEFAULT_MAX_INTERVAL_MAX_BUCKET_WIDTH) ?
-				   DEFAULT_MAX_INTERVAL_MULTIPLIER * bucket_width :
-				   PG_INT64_MAX;
-	}
-	return continuous_agg_parse_max_interval_per_job(column_type,
-													 with_clause_options,
-													 bucket_width);
-}
-
-static int64
-get_ignore_invalidation_older_than(Oid column_type, WithClauseResult *with_clause_options)
-{
-	if (with_clause_options[ContinuousViewOptionIgnoreInvalidationOlderThan].is_default)
-		return PG_INT64_MAX;
-	return continuous_agg_parse_ignore_invalidation_older_than(column_type, with_clause_options);
+		elog(ERROR, "continuous aggregate view must include a valid time bucket function");
 }
 
 static bool
@@ -705,9 +689,7 @@ cagg_agg_validate(Node *node, void *context)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("aggregates with FILTER / DISTINCT / ORDER BY are not supported for "
-							"continuous "
-							"aggregate query")));
+					 errmsg("aggregates with FILTER / DISTINCT / ORDER BY are not supported")));
 		}
 		/* Fetch the pg_aggregate row */
 		aggtuple = SearchSysCache1(AGGFNOID, agg->aggfnoid);
@@ -719,8 +701,7 @@ cagg_agg_validate(Node *node, void *context)
 			ReleaseSysCache(aggtuple);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("ordered set/hypothetical aggregates are not supported by "
-							"continuous aggregate query")));
+					 errmsg("ordered set/hypothetical aggregates are not supported")));
 		}
 		if (aggform->aggcombinefn == InvalidOid ||
 			(aggform->aggtranstype == INTERNALOID && aggform->aggdeserialfn == InvalidOid))
@@ -728,8 +709,7 @@ cagg_agg_validate(Node *node, void *context)
 			ReleaseSysCache(aggtuple);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("aggregates which are not parallelizable are not supported by "
-							"continuous aggregate query")));
+					 errmsg("aggregates which are not parallelizable are not supported")));
 		}
 		ReleaseSysCache(aggtuple);
 
@@ -752,7 +732,8 @@ cagg_validate_query(Query *query)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("only SELECT query permitted for continuous aggregate query")));
+				 errmsg("invalid continuous aggregate query"),
+				 errhint("Use a SELECT query in the continuous aggregate view.")));
 	}
 	if (query->hasWindowFuncs || query->hasSubLinks || query->hasDistinctOn ||
 		query->hasRecursive || query->hasModifyingCTE || query->hasForUpdate ||
@@ -762,7 +743,7 @@ cagg_validate_query(Query *query)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("invalid SELECT query for continuous aggregate")));
+				 errmsg("invalid continuous aggregate view")));
 	}
 	if (!query->groupClause)
 	{
@@ -770,8 +751,9 @@ cagg_validate_query(Query *query)
 		 * for groupClause*/
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT query for continuous aggregate should have at least 1 aggregate "
-						"function and a GROUP BY clause with time_bucket")));
+				 errmsg("invalid continuous aggregate view"),
+				 errhint("Include at least one aggregate function"
+						 " and a GROUP BY clause with time bucket.")));
 	}
 	/*validate aggregates allowed */
 	cagg_agg_validate((Node *) query->targetList, NULL);
@@ -782,8 +764,7 @@ cagg_validate_query(Query *query)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg(
-					 "only 1 hypertable is permitted in SELECT query for continuous aggregate")));
+				 errmsg("only one hypertable allowed in continuous aggregate view")));
 	}
 	/* check if we have a hypertable in the FROM clause */
 	rtref = linitial_node(RangeTblRef, query->jointree->fromlist);
@@ -793,19 +774,18 @@ cagg_validate_query(Query *query)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("invalid SELECT query for continuous aggregate")));
+				 errmsg("invalid continuous aggregate view")));
 	}
 	if (rte->relkind == RELKIND_RELATION)
 	{
 		Dimension *part_dimension = NULL;
-		Oid now_func = InvalidOid;
 
 		ht = ts_hypertable_cache_get_cache_and_entry(rte->relid, CACHE_FLAG_NONE, &hcache);
 
 		if (hypertable_is_distributed(ht))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("continuous aggregates are not supported on distributed hypertables")));
+					 errmsg("continuous aggregates not supported on distributed hypertables")));
 
 		/* there can only be one continuous aggregate per table */
 		switch (ts_continuous_agg_hypertable_status(ht->fd.id))
@@ -814,16 +794,13 @@ cagg_validate_query(Query *query)
 			case HypertableIsMaterializationAndRaw:
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("hypertable is a continuous aggregate materialization table"),
-						 errhint(
-							 "creating continuous aggregates based on continuous aggregates is not "
-							 "yet supported")));
+						 errmsg("hypertable is a continuous aggregate materialization table")));
 			case HypertableIsRawTable:
 				break;
 			case HypertableIsNotContinuousAgg:
 				break;
 			default:
-				Assert(false && "unreachable");
+				Assert(false);
 		}
 
 		/* get primary partitioning column information */
@@ -836,28 +813,22 @@ cagg_validate_query(Query *query)
 		if (part_dimension->partitioning != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("continuous aggregate do not support custom partitioning functions")));
+					 errmsg("custom partitioning functions not supported"
+							" with continuous aggregates")));
 
 		if (IS_INTEGER_TYPE(ts_dimension_get_partition_type(part_dimension)))
 		{
-			List *now_funcname;
-			Oid argtypes[] = { 0 };
 			const char *funcschema = NameStr(part_dimension->fd.integer_now_func_schema);
 			const char *funcname = NameStr(part_dimension->fd.integer_now_func);
 
 			if (strlen(funcschema) == 0 || strlen(funcname) == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("missing integer-now function on hypertable \"%s\"",
+						 errmsg("custom time function required on hypertable \"%s\"",
 								get_rel_name(ht->main_table_relid)),
-						 errdetail("An integer-based hypertable requires and integer-now function "
-								   "before creating continuous aggregates."),
-						 errhint("Set an integer-now function to create continuous aggregates.")));
-
-			now_funcname =
-				list_make2(makeString((char *) funcschema), makeString((char *) funcname));
-			now_func = LookupFuncName(now_funcname, 0, argtypes, false);
-			Assert(OidIsValid(now_func));
+						 errdetail("An integer-based hypertable requires a custom time"
+								   " function to support continuous aggregates."),
+						 errhint("Set a custom time function on the hypertable.")));
 		}
 
 		caggtimebucketinfo_init(&ret,
@@ -865,20 +836,17 @@ cagg_validate_query(Query *query)
 								ht->main_table_relid,
 								part_dimension->column_attno,
 								part_dimension->fd.column_type,
-								part_dimension->fd.interval_length,
-								now_func);
+								part_dimension->fd.interval_length);
 
 		ts_cache_release(hcache);
 	}
 
 	/*check row security settings for the table */
 	if (ts_has_row_security(rte->relid))
-	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg(
-					 "continuous aggregate query cannot be created on table with row security")));
-	}
+				 errmsg("cannot create continuous aggregate on hypertable with row security")));
+
 	/* we need a GROUP By clause with time_bucket on the partitioning
 	 * column of the hypertable
 	 */
@@ -1155,13 +1123,14 @@ mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input, int original_q
 	Var *var;
 	Oid coltype, colcollation;
 	int32 coltypmod;
+
 	if (contain_mutable_functions(input))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("only immutable functions are supported for continuous aggregate query"),
-				 errhint("Many time-based function that are not immutable have immutable "
-						 "alternatives that require specifying the timezone explicitly")));
+				 errmsg("only immutable functions supported in continuous aggregate view"),
+				 errhint("Make sure the function includes only immutable expressions,"
+						 " e.g., time_bucket('1 hour', time AT TIME ZONE 'GMT').")));
 	}
 	switch (nodeTag(input))
 	{
@@ -1215,6 +1184,8 @@ mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input, int original_q
 			part_te = (TargetEntry *) copyObject(input);
 			/*need to project all the partial entries so that materialization table is filled */
 			part_te->resjunk = false;
+			part_te->resno = matcolno;
+
 			if (timebkt_chk)
 			{
 				col->is_not_null = true;
@@ -1595,15 +1566,14 @@ fixup_userview_query_tlist(Query *userquery, List *tlist_aliases)
 			if (tle->resjunk)
 				continue;
 			tle->resname = pstrdup(strVal(lfirst(alist_item)));
-			alist_item = lnext(alist_item);
+			alist_item = lnext_compat(tlist_aliases, alist_item);
 			if (alist_item == NULL)
 				break; /* done assigning aliases */
 		}
 
 		if (alist_item != NULL)
 			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("too many column names were specified")));
+					(errcode(ERRCODE_SYNTAX_ERROR), errmsg("too many column names specified")));
 	}
 }
 
@@ -1662,8 +1632,8 @@ fixup_userview_query_tlist(Query *userquery, List *tlist_aliases)
  *        )
  */
 static void
-cagg_create(ViewStmt *stmt, Query *panquery, CAggTimebucketInfo *origquery_ht,
-			WithClauseResult *with_clause_options)
+cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquery,
+			CAggTimebucketInfo *origquery_ht, WithClauseResult *with_clause_options)
 {
 	ObjectAddress mataddress;
 	char relnamebuf[NAMEDATALEN];
@@ -1681,14 +1651,6 @@ cagg_create(ViewStmt *stmt, Query *panquery, CAggTimebucketInfo *origquery_ht,
 	int32 materialize_hypertable_id;
 	char trigarg[NAMEDATALEN];
 	int ret;
-	int64 refresh_lag = get_refresh_lag(origquery_ht->htpartcoltype,
-										origquery_ht->bucket_width,
-										with_clause_options);
-	int64 max_interval_per_job = get_max_interval_per_job(origquery_ht->htpartcoltype,
-														  with_clause_options,
-														  origquery_ht->bucket_width);
-	int64 ignore_invalidation_older_than =
-		get_ignore_invalidation_older_than(origquery_ht->htpartcoltype, with_clause_options);
 	bool materialized_only =
 		DatumGetBool(with_clause_options[ContinuousViewOptionMaterializedOnly].parsed);
 
@@ -1721,6 +1683,10 @@ cagg_create(ViewStmt *stmt, Query *panquery, CAggTimebucketInfo *origquery_ht,
 													mat_rel,
 													origquery_ht,
 													is_create_mattbl_index,
+													create_stmt->into->tableSpaceName,
+#if PG12_GE
+													create_stmt->into->accessMethod,
+#endif
 													&mataddress);
 	/* Step 2: create view with select finalize from materialization
 	 * table
@@ -1762,9 +1728,6 @@ cagg_create(ViewStmt *stmt, Query *panquery, CAggTimebucketInfo *origquery_ht,
 							  part_rel->schemaname,
 							  part_rel->relname,
 							  origquery_ht->bucket_width,
-							  refresh_lag,
-							  max_interval_per_job,
-							  ignore_invalidation_older_than,
 							  materialized_only,
 							  dum_rel->schemaname,
 							  dum_rel->relname);
@@ -1796,7 +1759,6 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 	};
 
 	nspid = RangeVarGetCreationNamespace(stmt->into->rel);
-
 	if (get_relname_relid(stmt->into->rel->relname, nspid))
 	{
 		if (stmt->if_not_exists)
@@ -1812,15 +1774,42 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_TABLE),
 					 errmsg("continuous aggregate \"%s\" already exists", stmt->into->rel->relname),
-					 errhint(
-						 "Drop or rename the existing continuous aggregate first or use another "
-						 "name.")));
+					 errhint("Drop or rename the existing continuous aggregate"
+							 " first or use another name.")));
 		}
 	}
 
 	timebucket_exprinfo = cagg_validate_query((Query *) stmt->into->viewQuery);
-	cagg_create(&viewstmt, (Query *) stmt->query, &timebucket_exprinfo, with_clause_options);
+	cagg_create(stmt, &viewstmt, (Query *) stmt->query, &timebucket_exprinfo, with_clause_options);
 
+	if (!stmt->into->skipData)
+	{
+		Oid relid;
+		ContinuousAgg *cagg;
+		Hypertable *cagg_ht;
+		Dimension *time_dim;
+		InternalTimeRange refresh_window = {
+			.type = InvalidOid,
+		};
+
+		CommandCounterIncrement();
+
+		/* We are creating a refresh window here in a similar way to how it's
+		 * done in continuous_agg_refresh. We do not call the PG function
+		 * directly since we want to be able to surpress the output in that
+		 * function and adding a 'verbose' parameter to is not useful for a
+		 * user. */
+		relid = get_relname_relid(stmt->into->rel->relname, nspid);
+		cagg = ts_continuous_agg_find_by_relid(relid);
+		Assert(cagg != NULL);
+		cagg_ht = ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
+		time_dim = hyperspace_get_open_dimension(cagg_ht->space, 0);
+		refresh_window.type = ts_dimension_get_partition_type(time_dim);
+		refresh_window.start = ts_time_get_min(refresh_window.type);
+		refresh_window.end = ts_time_get_noend_or_max(refresh_window.type);
+
+		continuous_agg_refresh_internal(cagg, &refresh_window, true);
+	}
 	return DDL_DONE;
 }
 
@@ -1908,29 +1897,8 @@ cagg_boundary_make_lower_bound(Oid type)
 	bool typbyval;
 
 	get_typlenbyval(type, &typlen, &typbyval);
+	value = ts_time_datum_get_nobegin_or_min(type);
 
-	switch (type)
-	{
-		case INT2OID:
-			value = Int16GetDatum(PG_INT16_MIN);
-			break;
-		case DATEOID:
-		case INT4OID:
-			value = Int32GetDatum(PG_INT32_MIN);
-			break;
-		case INT8OID:
-		case TIMESTAMPTZOID:
-		case TIMESTAMPOID:
-			value = Int64GetDatum(PG_INT64_MIN);
-			break;
-		default:
-			/* validation at earlier stages should prevent ever reaching this */
-			ereport(ERROR,
-					(errcode(ERRCODE_TS_INTERNAL_ERROR),
-					 errmsg("unsupported datatype \"%s\" for continuous aggregate",
-							format_type_be(type))));
-			pg_unreachable();
-	}
 	return makeConst(type, -1, InvalidOid, typlen, value, false, typbyval);
 }
 

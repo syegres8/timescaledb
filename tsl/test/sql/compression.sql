@@ -26,10 +26,10 @@ update foo set c = 40
 where  a = (SELECT max(a) FROM foo);
 SET timescaledb.enable_transparent_decompression to OFF;
 
-select id, schema_name, table_name, compressed, compressed_hypertable_id from
+select id, schema_name, table_name, compression_state as compressed, compressed_hypertable_id from
 _timescaledb_catalog.hypertable order by id;
 select * from _timescaledb_catalog.hypertable_compression order by hypertable_id, attname;
-select * from timescaledb_information.compression_settings ;
+select * from timescaledb_information.compression_settings ORDER BY hypertable_name;
 
 -- TEST2 compress-chunk for the chunks created earlier --
 select compress_chunk( '_timescaledb_internal._hyper_1_2_chunk');
@@ -37,7 +37,7 @@ select tgname , tgtype, tgenabled , relname
 from pg_trigger t, pg_class rel
 where t.tgrelid = rel.oid and rel.relname like '_hyper_1_2_chunk' order by tgname;
 \x
-select * from chunk_compression_stats('foo') 
+select * from chunk_compression_stats('foo')
 order by chunk_name limit 2;
 \x
 select compress_chunk( '_timescaledb_internal._hyper_1_1_chunk');
@@ -158,7 +158,7 @@ SELECT sum(_ts_meta_count) from :COMPRESSED_CHUNK_NAME;
 SELECT _ts_meta_sequence_num from :COMPRESSED_CHUNK_NAME;
 
 \x
-SELECT chunk_id, numrows_pre_compression, numrows_post_compression 
+SELECT chunk_id, numrows_pre_compression, numrows_post_compression
 FROM _timescaledb_catalog.chunk srcch,
       _timescaledb_catalog.compression_chunk_size map,
      _timescaledb_catalog.hypertable srcht
@@ -168,22 +168,22 @@ order by chunk_id;
 
 select * from chunk_compression_stats('conditions')
 order by chunk_name;
-select * from hypertable_compression_stats('foo'); 
-select * from hypertable_compression_stats('conditions'); 
+select * from hypertable_compression_stats('foo');
+select * from hypertable_compression_stats('conditions');
 vacuum full foo;
 vacuum full conditions;
 -- After vacuum, table_bytes is 0, but any associated index/toast storage is not
 -- completely reclaimed. Sets it at 8K (page size). So a chunk which has
 -- been compressed still incurs an overhead of n * 8KB (for every index + toast table) storage on the original uncompressed chunk.
 select pg_size_pretty(table_bytes), pg_size_pretty(index_bytes),
-pg_size_pretty(toast_bytes), pg_size_pretty(total_bytes) 
+pg_size_pretty(toast_bytes), pg_size_pretty(total_bytes)
 from hypertable_detailed_size('foo');
 select pg_size_pretty(table_bytes), pg_size_pretty(index_bytes),
-pg_size_pretty(toast_bytes), pg_size_pretty(total_bytes) 
+pg_size_pretty(toast_bytes), pg_size_pretty(total_bytes)
 from hypertable_detailed_size('conditions');
 select * from timescaledb_information.hypertables
-where table_name like 'foo' or table_name like 'conditions'
-order by table_name;
+where hypertable_name like 'foo' or hypertable_name like 'conditions'
+order by hypertable_name;
 \x
 
 SELECT decompress_chunk(ch1.schema_name|| '.' || ch1.table_name) AS chunk
@@ -331,10 +331,9 @@ SELECT
   avg(v1) + avg(v2) AS avg1,
   avg(v1+v2) AS avg2
 FROM metrics
-GROUP BY 1;
+GROUP BY 1 WITH NO DATA;
 
-SET timescaledb.current_timestamp_mock = '2000-01-10';
-REFRESH MATERIALIZED VIEW cagg_expr;
+CALL refresh_continuous_aggregate('cagg_expr', NULL, NULL);
 SELECT * FROM cagg_expr ORDER BY time LIMIT 5;
 
 ALTER TABLE metrics set(timescaledb.compress);
@@ -446,17 +445,17 @@ SELECT drop_chunks('ht5', newer_than => '2000-01-01'::TIMESTAMPTZ);
 select chunk_name from chunk_compression_stats('ht5')
 order by chunk_name;
 
--- Test enabling compression for a table with compound foreign key 
+-- Test enabling compression for a table with compound foreign key
 -- (Issue https://github.com/timescale/timescaledb/issues/2000)
 CREATE TABLE table2(col1 INT, col2 int, primary key (col1,col2));
 CREATE TABLE table1(col1 INT NOT NULL, col2 INT);
 ALTER TABLE table1 ADD CONSTRAINT fk_table1 FOREIGN KEY (col1,col2) REFERENCES table2(col1,col2);
 SELECT create_hypertable('table1','col1', chunk_time_interval => 10);
--- Trying to list an incomplete set of fields of the compound key (should fail with a nice message) 
+-- Trying to list an incomplete set of fields of the compound key (should fail with a nice message)
 ALTER TABLE table1 SET (timescaledb.compress, timescaledb.compress_segmentby = 'col1');
 -- Listing all fields of the compound key should succeed:
 ALTER TABLE table1 SET (timescaledb.compress, timescaledb.compress_segmentby = 'col1,col2');
-SELECT * FROM timescaledb_information.compression_settings ORDER BY table_name;
+SELECT * FROM timescaledb_information.compression_settings ORDER BY hypertable_name;
 
 -- test delete/update on non-compressed tables involving hypertables with compression
 CREATE TABLE uncompressed_ht (
@@ -520,8 +519,8 @@ WHERE series_id IN (SELECT series_id FROM compressed);
 DROP TABLE compressed_ht;
 DROP TABLE uncompressed_ht;
 
--- Test that pg_stats for uncompressed chunks are frozen at compression time
-
+-- Test that pg_stats and pg_class stats for uncompressed chunks are frozen at compression time
+-- Note that approximate_row_count pulls from pg_class
 CREATE TABLE stattest(time TIMESTAMPTZ NOT NULL, c1 int);
 SELECT create_hypertable('stattest', 'time');
 INSERT INTO stattest SELECT '2020/02/20 01:00'::TIMESTAMPTZ + ('1 hour'::interval * v), 250 * v FROM generate_series(0,25) v;
@@ -530,14 +529,29 @@ SELECT table_name INTO TEMPORARY temptable FROM _timescaledb_catalog.chunk WHERE
 SELECT * FROM pg_stats WHERE tablename = :statchunk;
 
 ALTER TABLE stattest SET (timescaledb.compress);
+SELECT approximate_row_count('stattest');
 SELECT compress_chunk(c) FROM show_chunks('stattest') c;
+SELECT approximate_row_count('stattest');
+SELECT relpages, reltuples FROM pg_class WHERE relname = :statchunk;
 SELECT histogram_bounds FROM pg_stats WHERE tablename = :statchunk AND attname = 'c1';
+
+SELECT compch.table_name  as "STAT_COMP_CHUNK_NAME"
+FROM _timescaledb_catalog.hypertable ht, _timescaledb_catalog.chunk ch 
+       , _timescaledb_catalog.chunk compch 
+  WHERE ht.table_name = 'stattest' AND ch.hypertable_id = ht.id
+        AND compch.id = ch.compressed_chunk_id AND ch.compressed_chunk_id > 0  \gset
+
+SELECT relpages, reltuples FROM pg_class WHERE relname = :'STAT_COMP_CHUNK_NAME';
 
 -- Now verify stats are not changed when we analyze the hypertable
 ANALYZE stattest;
 SELECT histogram_bounds FROM pg_stats WHERE tablename = :statchunk AND attname = 'c1';
 -- Unfortunately, the stats on the hypertable won't find any rows to sample from the chunk
 SELECT histogram_bounds FROM pg_stats WHERE tablename = 'stattest' AND attname = 'c1';
+SELECT relpages, reltuples FROM pg_class WHERE relname = :statchunk;
+
+-- verify that corresponding compressed chunk's stats is updated as well.
+SELECT relpages, reltuples FROM pg_class WHERE relname = :'STAT_COMP_CHUNK_NAME';
 
 -- Verify that even a global analyze doesn't affect the chunk stats, changing message scope here
 -- to hide WARNINGs for skipped tables
@@ -545,6 +559,7 @@ SET client_min_messages TO ERROR;
 ANALYZE;
 SET client_min_messages TO NOTICE;
 SELECT histogram_bounds FROM pg_stats WHERE tablename = :statchunk AND attname = 'c1';
+SELECT relpages, reltuples FROM pg_class WHERE relname = :statchunk;
 
 -- Verify that decompressing the chunk restores autoanalyze to the hypertable's setting
 SELECT reloptions FROM pg_class WHERE relname = :statchunk;
@@ -555,8 +570,79 @@ SELECT reloptions FROM pg_class WHERE relname = :statchunk;
 ALTER TABLE stattest SET (autovacuum_enabled = false);
 SELECT decompress_chunk(c) FROM show_chunks('stattest') c;
 SELECT reloptions FROM pg_class WHERE relname = :statchunk;
-
 DROP TABLE stattest;
+
+--- Test that analyze on compression internal table updates stats on original chunks
+CREATE TABLE stattest2(time TIMESTAMPTZ NOT NULL, c1 int, c2 int);
+SELECT create_hypertable('stattest2', 'time', chunk_time_interval=>'1 day'::interval);
+ALTER TABLE stattest2 SET (timescaledb.compress, timescaledb.compress_segmentby='c1');
+INSERT INTO stattest2 SELECT '2020/06/20 01:00'::TIMESTAMPTZ ,1 , generate_series(1, 200, 1);
+INSERT INTO stattest2 SELECT '2020/07/20 01:00'::TIMESTAMPTZ ,1 , generate_series(1, 200, 1);
+
+SELECT  compress_chunk(ch1.schema_name|| '.' || ch1.table_name)
+FROM _timescaledb_catalog.chunk ch1, _timescaledb_catalog.hypertable ht 
+WHERE ch1.hypertable_id = ht.id and ht.table_name like 'stattest2'
+ ORDER BY ch1.id limit 1;
+
+SELECT relname, reltuples, relpages, relallvisible FROM pg_class
+ WHERE relname in ( SELECT ch.table_name FROM 
+                   _timescaledb_catalog.chunk ch, _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = 'stattest2' AND ch.hypertable_id = ht.id )
+order by relname;
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+
+--overwrite pg_class stats for the compressed chunk.
+UPDATE pg_class
+SET reltuples = 0, relpages = 0
+ WHERE relname in ( SELECT ch.table_name FROM 
+    _timescaledb_catalog.chunk ch, 
+    _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = 'stattest2' AND ch.hypertable_id = ht.id 
+        AND ch.compressed_chunk_id > 0 );
+\c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
+
+SELECT relname, reltuples, relpages, relallvisible FROM pg_class
+ WHERE relname in ( SELECT ch.table_name FROM 
+                   _timescaledb_catalog.chunk ch, _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = 'stattest2' AND ch.hypertable_id = ht.id )
+order by relname;
+
+SELECT '_timescaledb_internal.' || compht.table_name as "STAT_COMP_TABLE",
+             compht.table_name  as "STAT_COMP_TABLE_NAME"
+FROM _timescaledb_catalog.hypertable ht, _timescaledb_catalog.hypertable compht
+WHERE ht.table_name = 'stattest2' AND ht.compressed_hypertable_id = compht.id \gset
+
+--analyze the compressed table, will update stats for the raw table.
+ANALYZE :STAT_COMP_TABLE;
+
+SELECT relname, reltuples, relpages, relallvisible FROM pg_class
+ WHERE relname in ( SELECT ch.table_name FROM 
+                   _timescaledb_catalog.chunk ch, _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = 'stattest2' AND ch.hypertable_id = ht.id )
+ORDER BY relname;
+
+SELECT relname, reltuples, relpages, relallvisible FROM pg_class
+ WHERE relname in ( SELECT ch.table_name FROM 
+                   _timescaledb_catalog.chunk ch, _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = :'STAT_COMP_TABLE_NAME' AND ch.hypertable_id = ht.id )
+ORDER BY relname;
+
+--analyze on stattest2 should not overwrite
+ANALYZE stattest2;
+SELECT relname, reltuples, relpages, relallvisible FROM pg_class
+ WHERE relname in ( SELECT ch.table_name FROM 
+                   _timescaledb_catalog.chunk ch, _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = 'stattest2' AND ch.hypertable_id = ht.id )
+ORDER BY relname;
+
+SELECT relname, reltuples, relpages, relallvisible FROM pg_class
+ WHERE relname in ( SELECT ch.table_name FROM 
+                   _timescaledb_catalog.chunk ch, _timescaledb_catalog.hypertable ht
+  WHERE ht.table_name = :'STAT_COMP_TABLE_NAME' AND ch.hypertable_id = ht.id )
+ORDER BY relname;
+
+-- analyze on compressed hypertable should restore stats
 
 -- Test approximate_row_count() with compressed hypertable
 --

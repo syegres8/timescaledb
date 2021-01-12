@@ -4,16 +4,17 @@
  * LICENSE-TIMESCALE for a copy of the license.
  */
 #include <postgres.h>
-#include <fmgr.h>
-#include <catalog/pg_aggregate.h>
-#include <catalog/pg_type.h>
-#include <utils/syscache.h>
-#include <utils/datum.h>
-#include <utils/builtins.h>
 #include <access/htup_details.h>
 #include <catalog/namespace.h>
+#include <catalog/pg_aggregate.h>
 #include <catalog/pg_collation.h>
+#include <catalog/pg_type.h>
+#include <fmgr.h>
 #include <parser/parse_agg.h>
+#include <parser/parse_coerce.h>
+#include <utils/builtins.h>
+#include <utils/datum.h>
+#include <utils/syscache.h>
 
 #include "compat.h"
 #include "partialize_finalize.h"
@@ -286,6 +287,7 @@ fa_perquery_state_init(FunctionCallInfo fcinfo)
 	MemoryContext qcontext = fcinfo->flinfo->fn_mcxt;
 	MemoryContext oldcontext = MemoryContextSwitchTo(qcontext);
 	AggState *fa_aggstate = (AggState *) fcinfo->context;
+	bool aggfinalextra;
 
 	/* look up catalog entry and populate what we need */
 	inner_agg_tuple = SearchSysCache1(AGGFNOID, inner_agg_fn_oid);
@@ -303,6 +305,7 @@ fa_perquery_state_init(FunctionCallInfo fcinfo)
 	tstate->combine_meta.combinefnoid = inner_agg_form->aggcombinefn;
 	tstate->combine_meta.deserialfnoid = inner_agg_form->aggdeserialfn;
 	tstate->combine_meta.transtype = inner_agg_form->aggtranstype;
+	aggfinalextra = inner_agg_form->aggfinalextra;
 	ReleaseSysCache(inner_agg_tuple);
 
 	/* initialize combine specific state, both the deserialize function and combine function */
@@ -337,7 +340,18 @@ fa_perquery_state_init(FunctionCallInfo fcinfo)
 	{
 		/* save information for internal deserialization. caching instead
 		   of calling ReceiveFunctionCall */
-		getTypeBinaryInputInfo(tstate->combine_meta.transtype,
+
+		/* If the argument type of the aggregate function is a pseudotype the
+		 * lookup/execution of the input function will fail. In that case we
+		 * use the argument type of the finalize_agg_ffunc return_type_dummy_val
+		 * argument instead. */
+		Oid column_type;
+		if (TypeCategory(tstate->combine_meta.transtype) != TYPCATEGORY_PSEUDOTYPE)
+			column_type = tstate->combine_meta.transtype;
+		else
+			column_type = get_fn_expr_argtype(fcinfo->flinfo, 6);
+
+		getTypeBinaryInputInfo(column_type,
 							   &tstate->combine_meta.recv_fn,
 							   &tstate->combine_meta.typIOParam);
 		fmgr_info_cxt(tstate->combine_meta.recv_fn,
@@ -357,7 +371,7 @@ fa_perquery_state_init(FunctionCallInfo fcinfo)
 		int num_args = 1;
 		Oid *types = NULL;
 		size_t number_types = 0;
-		if (inner_agg_form->aggfinalextra)
+		if (aggfinalextra)
 		{
 			types = get_input_types(input_types, &number_types);
 			num_args += number_types;
@@ -380,7 +394,7 @@ fa_perquery_state_init(FunctionCallInfo fcinfo)
 			int i;
 			build_aggregate_finalfn_expr(types,
 										 num_args,
-										 inner_agg_form->aggtranstype,
+										 tstate->combine_meta.transtype,
 										 types[number_types - 1],
 										 collation,
 										 tstate->final_meta.finalfnoid,

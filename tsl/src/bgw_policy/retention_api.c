@@ -21,7 +21,6 @@
 #include "errors.h"
 #include "hypertable.h"
 #include "dimension.h"
-#include "license.h"
 #include "policy_utils.h"
 #include "utils.h"
 #include "jsonb_utils.h"
@@ -29,7 +28,7 @@
 
 #define POLICY_RETENTION_PROC_NAME "policy_retention"
 #define CONFIG_KEY_HYPERTABLE_ID "hypertable_id"
-#define CONFIG_KEY_RETENTION_WINDOW "retention_window"
+#define CONFIG_KEY_DROP_AFTER "drop_after"
 
 Datum
 policy_retention_proc(PG_FUNCTION_ARGS)
@@ -37,7 +36,7 @@ policy_retention_proc(PG_FUNCTION_ARGS)
 	if (PG_NARGS() != 2 || PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		PG_RETURN_VOID();
 
-	PreventCommandIfReadOnly("policy_retention()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	policy_retention_execute(PG_GETARG_INT32(0), PG_GETARG_JSONB_P(1));
 
@@ -59,28 +58,28 @@ policy_retention_get_hypertable_id(const Jsonb *config)
 }
 
 int64
-policy_retention_get_retention_window_int(const Jsonb *config)
+policy_retention_get_drop_after_int(const Jsonb *config)
 {
 	bool found;
-	int32 hypertable_id = ts_jsonb_get_int64_field(config, CONFIG_KEY_RETENTION_WINDOW, &found);
+	int32 hypertable_id = ts_jsonb_get_int64_field(config, CONFIG_KEY_DROP_AFTER, &found);
 
 	if (!found)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not find retention_window in config for job")));
+				 errmsg("could not find %s in config for job", CONFIG_KEY_DROP_AFTER)));
 
 	return hypertable_id;
 }
 
 Interval *
-policy_retention_get_retention_window_interval(const Jsonb *config)
+policy_retention_get_drop_after_interval(const Jsonb *config)
 {
-	Interval *interval = ts_jsonb_get_interval_field(config, CONFIG_KEY_RETENTION_WINDOW);
+	Interval *interval = ts_jsonb_get_interval_field(config, CONFIG_KEY_DROP_AFTER);
 
 	if (interval == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not find retention_window in config for job")));
+				 errmsg("could not find %s in config for job", CONFIG_KEY_DROP_AFTER)));
 
 	return interval;
 }
@@ -93,7 +92,7 @@ validate_drop_chunks_hypertable(Cache *hcache, Oid user_htoid)
 
 	if (ht != NULL)
 	{
-		if (ht->fd.compressed)
+		if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -117,15 +116,15 @@ validate_drop_chunks_hypertable(Cache *hcache, Oid user_htoid)
 	{
 		/*check if this is a cont aggregate view */
 		int32 mat_id;
-		char *schema = get_namespace_name(get_rel_namespace(user_htoid));
-		char *view_name = get_rel_name(user_htoid);
-		ContinuousAgg *ca = NULL;
-		ca = ts_continuous_agg_find_by_view_name(schema, view_name);
+		ContinuousAgg *ca;
+
+		ca = ts_continuous_agg_find_by_relid(user_htoid);
+
 		if (ca == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_TS_HYPERTABLE_NOT_EXIST),
-					 errmsg("\"%s\" is not a hypertable or a continuous aggregate view",
-							view_name)));
+					 errmsg("\"%s\" is not a hypertable or a continuous aggregate",
+							get_rel_name(user_htoid))));
 		mat_id = ca->data.mat_hypertable_id;
 		ht = ts_hypertable_get_by_id(mat_id);
 	}
@@ -158,7 +157,7 @@ policy_retention_add(PG_FUNCTION_ARGS)
 	/* Right now, there is an infinite number of retries for drop_chunks jobs */
 	int default_max_retries = -1;
 
-	PreventCommandIfReadOnly("add_retention_policy()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
 	/* Verify that the hypertable owner can create a background worker */
 	ts_bgw_job_validate_job_owner(owner_id);
@@ -186,7 +185,7 @@ policy_retention_add(PG_FUNCTION_ARGS)
 		BgwJob *existing = linitial(jobs);
 
 		if (policy_config_check_hypertable_lag_equality(existing->fd.config,
-														CONFIG_KEY_RETENTION_WINDOW,
+														CONFIG_KEY_DROP_AFTER,
 														partitioning_type,
 														window_type,
 														window_datum))
@@ -194,16 +193,18 @@ policy_retention_add(PG_FUNCTION_ARGS)
 			/* If all arguments are the same, do nothing */
 			ts_cache_release(hcache);
 			ereport(NOTICE,
-					(errmsg("retention policy already exists on hypertable \"%s\", skipping",
+					(errmsg("retention policy already exists for hypertable \"%s\", skipping",
 							get_rel_name(ht_oid))));
 			PG_RETURN_INT32(-1);
 		}
 		else
 		{
 			ts_cache_release(hcache);
-			elog(WARNING,
-				 "could not add retention policy due to existing policy on hypertable with "
-				 "different arguments");
+			ereport(WARNING,
+					(errmsg("retention policy already exists for hypertable \"%s\"",
+							get_rel_name(ht_oid)),
+					 errdetail("A policy already exists with different arguments."),
+					 errhint("Remove the existing policy before adding a new one.")));
 			PG_RETURN_INT32(-1);
 		}
 	}
@@ -211,16 +212,16 @@ policy_retention_add(PG_FUNCTION_ARGS)
 	if (IS_INTEGER_TYPE(partitioning_type) && !IS_INTEGER_TYPE(window_type))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid parameter value for retention_window"),
-				 errhint("integer time duration is required for hypertables with integer time "
-						 "dimension")));
+				 errmsg("invalid value for parameter %s", CONFIG_KEY_DROP_AFTER),
+				 errhint("Integer time duration is required for hypertables"
+						 " with integer time dimension.")));
 
 	if (IS_TIMESTAMP_TYPE(partitioning_type) && window_type != INTERVALOID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid parameter value for retention_window"),
-				 errhint("interval time duration is required for hypertable with timestamp-based "
-						 "time dimension")));
+				 errmsg("invalid value for parameter %s", CONFIG_KEY_DROP_AFTER),
+				 errhint("Interval time duration is required for hypertable"
+						 " with timestamp-based time dimension.")));
 
 	JsonbParseState *parse_state = NULL;
 
@@ -231,28 +232,23 @@ policy_retention_add(PG_FUNCTION_ARGS)
 	{
 		case INTERVALOID:
 			ts_jsonb_add_interval(parse_state,
-								  CONFIG_KEY_RETENTION_WINDOW,
+								  CONFIG_KEY_DROP_AFTER,
 								  DatumGetIntervalP(window_datum));
 			break;
 		case INT2OID:
-			ts_jsonb_add_int64(parse_state,
-							   CONFIG_KEY_RETENTION_WINDOW,
-							   DatumGetInt16(window_datum));
+			ts_jsonb_add_int64(parse_state, CONFIG_KEY_DROP_AFTER, DatumGetInt16(window_datum));
 			break;
 		case INT4OID:
-			ts_jsonb_add_int64(parse_state,
-							   CONFIG_KEY_RETENTION_WINDOW,
-							   DatumGetInt32(window_datum));
+			ts_jsonb_add_int64(parse_state, CONFIG_KEY_DROP_AFTER, DatumGetInt32(window_datum));
 			break;
 		case INT8OID:
-			ts_jsonb_add_int64(parse_state,
-							   CONFIG_KEY_RETENTION_WINDOW,
-							   DatumGetInt64(window_datum));
+			ts_jsonb_add_int64(parse_state, CONFIG_KEY_DROP_AFTER, DatumGetInt64(window_datum));
 			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("unsupported datatype for retention_window: %s",
+					 errmsg("unsupported datatype for %s: %s",
+							CONFIG_KEY_DROP_AFTER,
 							format_type_be(window_type))));
 	}
 
@@ -291,28 +287,27 @@ policy_retention_remove(PG_FUNCTION_ARGS)
 	Oid table_oid = PG_GETARG_OID(0);
 	bool if_exists = PG_GETARG_BOOL(1);
 	Cache *hcache;
+	Hypertable *hypertable;
 
-	PreventCommandIfReadOnly("remove_retention_policy()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 
-	Hypertable *hypertable = ts_hypertable_cache_get_cache_and_entry(table_oid, true, &hcache);
+	hypertable = ts_hypertable_cache_get_cache_and_entry(table_oid, CACHE_FLAG_MISSING_OK, &hcache);
 	if (!hypertable)
 	{
-		char *view_name = get_rel_name(table_oid);
+		const char *view_name = get_rel_name(table_oid);
+
 		if (!view_name)
-		{
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("OID %d does not refer to a hypertable or continuous aggregate",
-							table_oid)));
-		}
+					 errmsg("relation is not a hypertable or continuous aggregate")));
 		else
 		{
-			char *schema_name = get_namespace_name(get_rel_namespace(table_oid));
-			ContinuousAgg *ca = ts_continuous_agg_find_by_view_name(schema_name, view_name);
+			ContinuousAgg *ca = ts_continuous_agg_find_by_relid(table_oid);
+
 			if (!ca)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("no hypertable or continuous aggregate by the name \"%s\" exists",
+						 errmsg("relation \"%s\" is not a hypertable or continuous aggregate",
 								view_name)));
 			hypertable = ts_hypertable_get_by_id(ca->data.mat_hypertable_id);
 		}
@@ -331,11 +326,12 @@ policy_retention_remove(PG_FUNCTION_ARGS)
 		if (!if_exists)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("cannot remove retention policy, no such policy exists")));
+					 errmsg("retention policy not found for hypertable \"%s\"",
+							get_rel_name(table_oid))));
 		else
 		{
 			ereport(NOTICE,
-					(errmsg("retention policy does not exist on hypertable \"%s\", skipping",
+					(errmsg("retention policy not found for hypertable \"%s\", skipping",
 							get_rel_name(table_oid))));
 			PG_RETURN_NULL();
 		}

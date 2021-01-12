@@ -13,6 +13,8 @@
 #include "materialize.h"
 
 extern Datum continuous_agg_refresh(PG_FUNCTION_ARGS);
-void continuous_agg_refresh_internal(ContinuousAgg *cagg, InternalTimeRange *refresh_window);
+extern Datum continuous_agg_refresh_chunk(PG_FUNCTION_ARGS);
+extern void continuous_agg_refresh_internal(const ContinuousAgg *cagg,
+											const InternalTimeRange *refresh_window, bool verbose);
 
 #endif /* TIMESCALEDB_TSL_CONTINUOUS_AGGS_REFRESH_H */

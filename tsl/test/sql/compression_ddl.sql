@@ -330,13 +330,14 @@ DROP VIEW dependent_1;
 
 
 --create a cont agg view on the ht as well then the drop should nuke everything
-SET timescaledb.current_timestamp_mock = '2018-03-28 1:00';
-CREATE MATERIALIZED VIEW test1_cont_view WITH (timescaledb.continuous, timescaledb.materialized_only=true)
+CREATE MATERIALIZED VIEW test1_cont_view
+WITH (timescaledb.continuous,
+      timescaledb.materialized_only=true)
 AS SELECT time_bucket('1 hour', "Time"), SUM(i)
    FROM test1
-   GROUP BY 1;
-SELECT add_refresh_continuous_aggregate_policy('test1_cont_view', NULL, '1 hour'::interval, '1 day'::interval);
-REFRESH MATERIALIZED VIEW test1_cont_view;
+   GROUP BY 1 WITH NO DATA;
+SELECT add_continuous_aggregate_policy('test1_cont_view', NULL, '1 hour'::interval, '1 day'::interval);
+CALL refresh_continuous_aggregate('test1_cont_view', NULL, NULL);
 
 SELECT count(*) FROM test1_cont_view;
 
@@ -444,4 +445,3 @@ SELECT decompress_chunk(chunk.schema_name|| '.' || chunk.table_name)
 FROM _timescaledb_catalog.chunk chunk
 INNER JOIN _timescaledb_catalog.hypertable hypertable ON (chunk.hypertable_id = hypertable.id)
 WHERE hypertable.table_name like 'test1'  ORDER BY chunk.id ) as subq;
-

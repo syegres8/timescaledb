@@ -66,7 +66,7 @@ INSERT INTO public.bgw_dsm_handle_store VALUES (0);
 SELECT ts_bgw_params_create();
 
 SELECT * FROM _timescaledb_config.bgw_job;
-SELECT * FROM timescaledb_information.policy_stats;
+SELECT * FROM timescaledb_information.job_stats;
 SELECT * FROM _timescaledb_catalog.continuous_agg;
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
@@ -79,17 +79,15 @@ CREATE MATERIALIZED VIEW test_continuous_agg_view
     WITH (timescaledb.continuous, timescaledb.materialized_only=true)
     AS SELECT time_bucket('2', time), SUM(data) as value
         FROM test_continuous_agg_table
-        GROUP BY 1;
-SELECT add_refresh_continuous_aggregate_policy('test_continuous_agg_view', NULL, 4::integer, '12 h'::interval);
+        GROUP BY 1 WITH NO DATA;
 
--- even before running, stats shows something
-SELECT view_name, completed_threshold, invalidation_threshold, job_status, last_run_duration
-    FROM timescaledb_information.continuous_aggregate_stats;
+SELECT add_continuous_aggregate_policy('test_continuous_agg_view', NULL, 4::integer, '12 h'::interval);
 
 SELECT id as raw_table_id FROM _timescaledb_catalog.hypertable WHERE table_name='test_continuous_agg_table' \gset
 
 -- min distance from end should be 1
-SELECT  mat_hypertable_id, user_view_schema, user_view_name, bucket_width, refresh_lag, ignore_invalidation_older_than FROM _timescaledb_catalog.continuous_agg;
+SELECT  mat_hypertable_id, user_view_schema, user_view_name, bucket_width
+FROM _timescaledb_catalog.continuous_agg;
 SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg \gset
 SELECT id AS job_id FROM _timescaledb_config.bgw_job where hypertable_id=:mat_hypertable_id \gset
 
@@ -127,40 +125,40 @@ TRUNCATE public.bgw_log;
 CREATE FUNCTION wait_for_timer_to_run(started_at INTEGER, spins INTEGER=:TEST_SPINWAIT_ITERS) RETURNS BOOLEAN LANGUAGE PLPGSQL AS
 $BODY$
 DECLARE
-	num_runs INTEGER;
-	message TEXT;
+    num_runs INTEGER;
+    message TEXT;
 BEGIN
-	select format('[TESTING] Wait until %%, started at %s', started_at) into message;
-	FOR i in 1..spins
-	LOOP
-	SELECT COUNT(*) from bgw_log where msg LIKE message INTO num_runs;
-	if (num_runs > 0) THEN
-		RETURN true;
-	ELSE
-		PERFORM pg_sleep(0.1);
-	END IF;
-	END LOOP;
-	RETURN false;
+    select format('[TESTING] Wait until %%, started at %s', started_at) into message;
+    FOR i in 1..spins
+    LOOP
+    SELECT COUNT(*) from bgw_log where msg LIKE message INTO num_runs;
+    if (num_runs > 0) THEN
+        RETURN true;
+    ELSE
+        PERFORM pg_sleep(0.1);
+    END IF;
+    END LOOP;
+    RETURN false;
 END
 $BODY$;
 
 CREATE FUNCTION wait_for_job_to_run(job_param_id INTEGER, expected_runs INTEGER, spins INTEGER=:TEST_SPINWAIT_ITERS) RETURNS BOOLEAN LANGUAGE PLPGSQL AS
 $BODY$
 DECLARE
-	num_runs INTEGER;
+    num_runs INTEGER;
 BEGIN
-	FOR i in 1..spins
-	LOOP
-	SELECT total_successes FROM _timescaledb_internal.bgw_job_stat WHERE job_id=job_param_id INTO num_runs;
-	if (num_runs = expected_runs) THEN
-		RETURN true;
+    FOR i in 1..spins
+    LOOP
+    SELECT total_successes FROM _timescaledb_internal.bgw_job_stat WHERE job_id=job_param_id INTO num_runs;
+    if (num_runs = expected_runs) THEN
+        RETURN true;
     ELSEIF (num_runs > expected_runs) THEN
         RAISE 'num_runs > expected';
-	ELSE
-		PERFORM pg_sleep(0.1);
-	END IF;
-	END LOOP;
-	RETURN false;
+    ELSE
+        PERFORM pg_sleep(0.1);
+    END IF;
+    END LOOP;
+    RETURN false;
 END
 $BODY$;
 
@@ -182,7 +180,7 @@ SELECT wait_for_job_to_run(:job_id, 2);
 --advance clock 1us to make the scheduler realize the job is done
 SELECT ts_bgw_params_reset_time((extract(epoch from interval '12 hour')::bigint * 1000000)+1, true);
 
---alter the refresh interval and check if next_scheduled_run is altered
+--alter the refresh interval and check if next_start is altered
 SELECT alter_job(:job_id, schedule_interval => '1m', retry_period => '1m');
 SELECT job_id, next_start - last_finish as until_next, total_runs
 FROM _timescaledb_internal.bgw_job_stat
@@ -217,21 +215,19 @@ TRUNCATE public.bgw_log;
 -- data before 8
 SELECT * FROM test_continuous_agg_view ORDER BY 1;
 
--- invalidations test by running job multiple times 
+-- invalidations test by running job multiple times
 SELECT ts_bgw_params_reset_time();
 
 DROP MATERIALIZED VIEW test_continuous_agg_view;
 
 CREATE MATERIALIZED VIEW test_continuous_agg_view
     WITH (timescaledb.continuous,
-        timescaledb.materialized_only=true,
-        timescaledb.max_interval_per_job='2',
-        timescaledb.refresh_lag='-2')
+        timescaledb.materialized_only=true)
     AS SELECT time_bucket('2', time), SUM(data) as value
         FROM test_continuous_agg_table
-        GROUP BY 1;
+        GROUP BY 1 WITH NO DATA;
 
-SELECT add_refresh_continuous_aggregate_policy('test_continuous_agg_view', NULL, -2::integer, '12 h'::interval);
+SELECT add_continuous_aggregate_policy('test_continuous_agg_view', NULL, -2::integer, '12 h'::interval);
 
 SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg \gset
 SELECT id AS job_id FROM _timescaledb_config.bgw_job WHERE hypertable_id=:mat_hypertable_id \gset
@@ -252,7 +248,7 @@ SELECT * FROM test_continuous_agg_view ORDER BY 1;
 UPDATE test_continuous_agg_table
 SET data = 11 WHERE time = 6;
 
---advance time by 12h so that job runs one more time 
+--advance time by 12h so that job runs one more time
 SELECT ts_bgw_params_reset_time(extract(epoch from interval '12 hour')::bigint * 1000000, true);
 
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25, 25);
@@ -263,19 +259,22 @@ SELECT job_id, next_start - last_finish as until_next, last_run_success, total_r
     FROM _timescaledb_internal.bgw_job_stat
     where job_id=:job_id;
 
--- should have updated data for time=6 
+-- should have updated data for time=6
 SELECT * FROM test_continuous_agg_view ORDER BY 1;
 
 \x on
 --check the information views --
-select view_name, view_owner, refresh_lag, max_interval_per_job, materialization_hypertable
+select view_name, view_owner, materialization_hypertable_schema, materialization_hypertable_name
 from timescaledb_information.continuous_aggregates
 where view_name::text like '%test_continuous_agg_view';
 
 select view_name, view_definition from timescaledb_information.continuous_aggregates
 where view_name::text like '%test_continuous_agg_view';
 
-select view_name, completed_threshold, invalidation_threshold, job_status, last_run_duration from timescaledb_information.continuous_aggregate_stats where view_name::text like '%test_continuous_agg_view';
+select job_status, last_run_duration
+from timescaledb_information.job_stats ps, timescaledb_information.continuous_aggregates cagg 
+where cagg.view_name::text like '%test_continuous_agg_view'
+and cagg.materialization_hypertable_name = ps.hypertable_name;
 
 \x off
 
@@ -284,14 +283,12 @@ DROP MATERIALIZED VIEW test_continuous_agg_view;
 --create a view with a function that it has no permission to execute
 CREATE MATERIALIZED VIEW test_continuous_agg_view
     WITH (timescaledb.continuous,
-        timescaledb.materialized_only=true,
-        timescaledb.max_interval_per_job='2',
-        timescaledb.refresh_lag='-2')
+        timescaledb.materialized_only=true)
     AS SELECT time_bucket('2', time), SUM(data) as value, get_constant_no_perms()
         FROM test_continuous_agg_table
-        GROUP BY 1;
-SELECT add_refresh_continuous_aggregate_policy('test_continuous_agg_view', NULL, -2::integer, '12 h'::interval);
+        GROUP BY 1 WITH NO DATA;
 
+SELECT add_continuous_aggregate_policy('test_continuous_agg_view', NULL, -2::integer, '12 h'::interval);
 
 SELECT id AS job_id FROM _timescaledb_config.bgw_job ORDER BY id desc limit 1 \gset
 
@@ -328,13 +325,12 @@ INSERT INTO test_continuous_agg_table_w_grant
 -- make sure view can be created
 CREATE MATERIALIZED VIEW test_continuous_agg_view_user_2
     WITH ( timescaledb.continuous,
-        timescaledb.materialized_only=true,
-        timescaledb.max_interval_per_job='2',
-        timescaledb.refresh_lag='-2')
+        timescaledb.materialized_only=true)
     AS SELECT time_bucket('2', time), SUM(data) as value
         FROM test_continuous_agg_table_w_grant
-        GROUP BY 1;
-SELECT add_refresh_continuous_aggregate_policy('test_continuous_agg_view_user_2', NULL, -2::integer, '12 h'::interval);
+        GROUP BY 1 WITH NO DATA;
+
+SELECT add_continuous_aggregate_policy('test_continuous_agg_view_user_2', NULL, -2::integer, '12 h'::interval);
 
 SELECT id AS job_id FROM _timescaledb_config.bgw_job ORDER BY id desc limit 1 \gset
 
@@ -357,7 +353,7 @@ INSERT INTO test_continuous_agg_table_w_grant VALUES(5,1);
 
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER_2
---advance time by 12h so that job tries to run one more time 
+--advance time by 12h so that job tries to run one more time
 SELECT ts_bgw_params_reset_time(extract(epoch from interval '12 hour')::bigint * 1000000, true);
 
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25, 25);
@@ -372,3 +368,7 @@ SELECT * FROM test_continuous_agg_view_user_2;
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
 SELECT * from sorted_bgw_log;
+
+-- check for corrects counts in telemetry
+SELECT json_object_field(get_telemetry_report(always_display_report := true)::json,'num_continuous_aggs_policies');
+

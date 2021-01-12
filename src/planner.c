@@ -44,6 +44,7 @@
 
 #include <math.h>
 
+#include "annotations.h"
 #include "cross_module_fn.h"
 #include "license_guc.h"
 #include "hypertable_cache.h"
@@ -254,7 +255,7 @@ preprocess_query(Node *node, Query *rootquery)
 							query->rowMarks == NIL && rte->inh)
 							rte_mark_for_expansion(rte);
 
-						if (TS_HYPERTABLE_HAS_COMPRESSION(ht))
+						if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
 						{
 							int compr_htid = ht->fd.compressed_hypertable_id;
 
@@ -277,7 +278,12 @@ preprocess_query(Node *node, Query *rootquery)
 }
 
 static PlannedStmt *
+#if PG13_GE
+timescaledb_planner(Query *parse, const char *query_string, int cursor_opts,
+					ParamListInfo bound_params)
+#else
 timescaledb_planner(Query *parse, int cursor_opts, ParamListInfo bound_params)
+#endif
 {
 	PlannedStmt *stmt;
 	ListCell *lc;
@@ -301,11 +307,19 @@ timescaledb_planner(Query *parse, int cursor_opts, ParamListInfo bound_params)
 			preprocess_query((Node *) parse, parse);
 
 		if (prev_planner_hook != NULL)
-			/* Call any earlier hooks */
+		/* Call any earlier hooks */
+#if PG13_GE
+			stmt = (prev_planner_hook)(parse, query_string, cursor_opts, bound_params);
+#else
 			stmt = (prev_planner_hook)(parse, cursor_opts, bound_params);
+#endif
 		else
-			/* Call the standard planner */
+		/* Call the standard planner */
+#if PG13_GE
+			stmt = standard_planner(parse, query_string, cursor_opts, bound_params);
+#else
 			stmt = standard_planner(parse, cursor_opts, bound_params);
+#endif
 
 		if (ts_extension_is_loaded())
 		{
@@ -383,12 +397,13 @@ classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **p
 		case RELOPT_BASEREL:
 			rte = planner_rt_fetch(rel->relid, root);
 			/*
-			 * to correctly classify relations in subqueries we cannot call get_hypertable
-			 * with CACHE_FLAG_NOCREATE flag because the rel might not be in cache yet
+			 * To correctly classify relations in subqueries we cannot call get_hypertable
+			 * with CACHE_FLAG_CHECK which includes CACHE_FLAG_NOCREATE flag because
+			 * the rel might not be in cache yet.
 			 */
 			ht = get_hypertable(rte->relid, rte->inh ? CACHE_FLAG_MISSING_OK : CACHE_FLAG_CHECK);
 
-			if (NULL != ht)
+			if (ht != NULL)
 				reltype = TS_REL_HYPERTABLE;
 			else
 			{
@@ -400,7 +415,7 @@ classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **p
 				 * there if we need to speed this up. */
 				Chunk *chunk = ts_chunk_get_by_relid(rte->relid, false);
 
-				if (NULL != chunk)
+				if (chunk != NULL)
 				{
 					reltype = TS_REL_CHUNK;
 					ht = get_hypertable(chunk->hypertable_relid, CACHE_FLAG_NONE);
@@ -420,7 +435,9 @@ classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **p
 			 */
 			if (parent_rte->rtekind == RTE_SUBQUERY)
 			{
-				ht = get_hypertable(rte->relid, CACHE_FLAG_CHECK);
+				ht =
+					get_hypertable(rte->relid, rte->inh ? CACHE_FLAG_MISSING_OK : CACHE_FLAG_CHECK);
+
 				if (ht != NULL)
 					reltype = TS_REL_HYPERTABLE;
 			}
@@ -428,7 +445,7 @@ classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **p
 			{
 				ht = get_hypertable(parent_rte->relid, CACHE_FLAG_CHECK);
 
-				if (NULL != ht)
+				if (ht != NULL)
 				{
 					if (parent_rte->relid == rte->relid)
 						reltype = TS_REL_HYPERTABLE_CHILD;
@@ -788,7 +805,7 @@ timescaledb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
 					ts_cm_functions->set_rel_pathlist_dml(root, rel, rti, rte, ht);
 				break;
 			}
-			/* Fall through */
+			TS_FALLTHROUGH;
 		default:
 			apply_optimizations(root, reltype, rel, rte, ht);
 			break;
@@ -861,22 +878,39 @@ timescaledb_get_relation_info_hook(PlannerInfo *root, Oid relation_objectid, boo
 		{
 			ts_create_private_reloptinfo(rel);
 
-			if (ts_guc_enable_transparent_decompression && TS_HYPERTABLE_HAS_COMPRESSION(ht))
+			if (ts_guc_enable_transparent_decompression && TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
 			{
 				RangeTblEntry *chunk_rte = planner_rt_fetch(rel->relid, root);
 				Chunk *chunk = ts_chunk_get_by_relid(chunk_rte->relid, true);
 
 				if (chunk->fd.compressed_chunk_id > 0)
 				{
+					Relation uncompressed_chunk = table_open(relation_objectid, NoLock);
+
 					ts_get_private_reloptinfo(rel)->compressed = true;
 
 					/* Planning indexes are expensive, and if this is a compressed chunk, we
-					 * know we'll never need to us indexes on the uncompressed version, since
+					 * know we'll never need to use indexes on the uncompressed version, since
 					 * all the data is in the compressed chunk anyway. Therefore, it is much
 					 * faster if we simply trash the indexlist here and never plan any useless
 					 * IndexPaths at all
 					 */
 					rel->indexlist = NIL;
+
+					/* Relation size estimates are messed up on compressed chunks due to there
+					 * being no actual pages for the table in the storage manager.
+					 */
+					rel->pages = (BlockNumber) uncompressed_chunk->rd_rel->relpages;
+					rel->tuples = (double) uncompressed_chunk->rd_rel->reltuples;
+					if (rel->pages == 0)
+						rel->allvisfrac = 0.0;
+					else if (uncompressed_chunk->rd_rel->relallvisible >= rel->pages)
+						rel->allvisfrac = 1.0;
+					else
+						rel->allvisfrac =
+							(double) uncompressed_chunk->rd_rel->relallvisible / rel->pages;
+
+					table_close(uncompressed_chunk, NoLock);
 				}
 			}
 			break;
@@ -1103,15 +1137,11 @@ check_cagg_view_rte(RangeTblEntry *rte)
 	foreach (rtlc, viewq->rtable)
 	{
 		RangeTblEntry *rte = lfirst_node(RangeTblEntry, rtlc);
-		char *schema;
-		char *table;
 
 		if (!OidIsValid(rte->relid))
 			break;
 
-		schema = get_namespace_name(get_rel_namespace(rte->relid));
-		table = get_rel_name(rte->relid);
-		if ((cagg = ts_continuous_agg_find_by_view_name(schema, table)) != NULL)
+		if ((cagg = ts_continuous_agg_find_by_relid(rte->relid)) != NULL)
 			found = true;
 	}
 	return found;

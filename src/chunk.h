@@ -110,7 +110,7 @@ extern Chunk *ts_chunk_create_from_point(Hypertable *ht, Point *p, const char *s
 
 extern TSDLLEXPORT Chunk *ts_chunk_create_base(int32 id, int16 num_constraints, const char relkind);
 extern TSDLLEXPORT ChunkStub *ts_chunk_stub_create(int32 id, int16 num_constraints);
-extern Chunk *ts_chunk_find(Hypertable *ht, Point *p);
+extern Chunk *ts_chunk_find(Hypertable *ht, Point *p, bool lock_slices);
 extern Chunk **ts_chunk_find_all(Hypertable *ht, List *dimension_vecs, LOCKMODE lockmode,
 								 unsigned int *num_chunks);
 extern List *ts_chunk_find_all_oids(Hypertable *ht, List *dimension_vecs, LOCKMODE lockmode);
@@ -161,6 +161,10 @@ extern TSDLLEXPORT Datum ts_chunk_id_from_relid(PG_FUNCTION_ARGS);
 extern TSDLLEXPORT List *ts_chunk_get_chunk_ids_by_hypertable_id(int32 hypertable_id);
 extern TSDLLEXPORT List *ts_chunk_get_data_node_name_list(const Chunk *chunk);
 extern List *ts_chunk_data_nodes_copy(const Chunk *chunk);
+
+extern TSDLLEXPORT int64 ts_chunk_primary_dimension_start(const Chunk *chunk);
+
+extern TSDLLEXPORT int64 ts_chunk_primary_dimension_end(const Chunk *chunk);
 
 #define chunk_get_by_name(schema_name, table_name, fail_if_not_found)                              \
 	ts_chunk_get_by_name_with_memory_context(schema_name,                                          \

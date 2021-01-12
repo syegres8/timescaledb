@@ -21,11 +21,16 @@ SELECT format('\! diff %s %s', :'TEST_RESULTS_UNOPTIMIZED', :'TEST_RESULTS_REFER
        format('\! diff %s %s', :'TEST_RESULTS_1DIM', :'TEST_RESULTS_REPART_REFERENCE') AS "DIFF_CMD_1DIM"
 \gset
 
+
+-- Use a small fetch size to make sure that result are fetched across
+-- multiple fetches.
+--ALTER FOREIGN DATA WRAPPER timescaledb_fdw OPTIONS (ADD fetch_size '500');
+SET timescaledb.remote_data_fetcher = 'rowbyrow';
 SET client_min_messages TO notice;
 
 -- Load the data
 \ir :TEST_LOAD_NAME
-SELECT table_schema, table_name, num_dimensions, num_chunks
+SELECT hypertable_schema, hypertable_name, num_dimensions, num_chunks
 FROM timescaledb_information.hypertables
 ORDER BY 1,2;
 SELECT count(*) FROM hyper;

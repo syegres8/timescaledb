@@ -26,8 +26,8 @@ CREATE OR REPLACE FUNCTION add_loopback_server(
     database               NAME = current_database(),
     port                   INTEGER = inet_server_port(),
     if_not_exists          BOOLEAN = FALSE,
-    bootstrap		   BOOLEAN = TRUE,
-    bootstrap_database     NAME = 'postgres'
+    bootstrap              BOOLEAN = TRUE,
+    password               TEXT = NULL
 ) RETURNS TABLE(server_name NAME, host TEXT, port INTEGER, database NAME,
                 server_created BOOL, database_created BOOL, extension_created BOOL)
 AS :TSL_MODULE_PATHNAME, 'ts_unchecked_add_data_node'
@@ -151,7 +151,17 @@ BEGIN;
     --connection in transaction
     SELECT node_name, connection_status, transaction_status, transaction_depth, processing
     FROM _timescaledb_internal.show_connection_cache() ORDER BY 1,4;
+
+-- since the error messages/warnings from this ROLLBACK varies between
+-- platforms/environments we remove it from test output and show
+-- SQLSTATE instead. SQLSTATE should be 00000 since we are not
+-- throwing errors during rollback/abort and it should succeed in any
+-- case.
+--<exclude_from_test>
 ROLLBACK;
+--</exclude_from_test>
+\echo 'ROLLBACK SQLSTATE' :SQLSTATE
+
 SELECT count(*) FROM "S 1"."T 1" WHERE "C 1" = 20005;
 SELECT count(*) FROM pg_prepared_xacts;
 
@@ -217,7 +227,13 @@ FROM _timescaledb_internal.show_connection_cache() ORDER BY 1,4;
 BEGIN;
     SELECT remote_node_killer_set_event('pre-prepare-transaction', 'loopback');
     SELECT test.remote_exec('{loopback}', $$ INSERT INTO "S 1"."T 1" VALUES (10002,1,'bleh', '2001-01-01', '2001-01-01', 'bleh') $$);
+-- since the error messages/warnings from this COMMIT varies between
+-- platforms/environments we remove it from test output and show SQLSTATE instead.
+-- SQLSTATE should be 08006 connection_failure
+--<exclude_from_test>
 COMMIT;
+--</exclude_from_test>
+\echo 'COMMIT SQLSTATE' :SQLSTATE
 
 --the connection was killed, so should be cleared
 SELECT node_name, connection_status, transaction_status, transaction_depth, processing
@@ -229,7 +245,13 @@ SELECT count(*) FROM pg_prepared_xacts;
 BEGIN;
     SELECT remote_node_killer_set_event('waiting-prepare-transaction', 'loopback');
     SELECT test.remote_exec('{loopback}', $$ INSERT INTO "S 1"."T 1" VALUES (10003,1,'bleh', '2001-01-01', '2001-01-01', 'bleh') $$);
+-- since the error messages/warnings from this COMMIT varies between
+-- platforms/environments we remove it from test output and show SQLSTATE instead.
+-- SQLSTATE should be 08006 connection_failure
+--<exclude_from_test>
 COMMIT;
+--</exclude_from_test>
+\echo 'COMMIT SQLSTATE' :SQLSTATE
 
 --the connection should be cleared from the cache
 SELECT node_name, connection_status, transaction_status, transaction_depth, processing
@@ -249,7 +271,13 @@ SELECT count(*) from _timescaledb_catalog.remote_txn;
 BEGIN;
     SELECT remote_node_killer_set_event('post-prepare-transaction', 'loopback');
     SELECT test.remote_exec('{loopback}', $$ INSERT INTO "S 1"."T 1" VALUES (10004,1,'bleh', '2001-01-01', '2001-01-01', 'bleh') $$);
+-- since the error messages/warnings from this COMMIT varies between
+-- platforms/environments we remove it from test output and show SQLSTATE instead.
+-- SQLSTATE should be 00000 successful_completion
+--<exclude_from_test>
 COMMIT;
+--</exclude_from_test>
+\echo 'COMMIT SQLSTATE' :SQLSTATE
 
 --connection should be cleared
 SELECT node_name, connection_status, transaction_status, transaction_depth, processing
@@ -279,7 +307,13 @@ select count(*) from _timescaledb_catalog.remote_txn;
 BEGIN;
     SELECT remote_node_killer_set_event('pre-commit-prepared', 'loopback');
     SELECT test.remote_exec('{loopback}', $$ INSERT INTO "S 1"."T 1" VALUES (10006,1,'bleh', '2001-01-01', '2001-01-01', 'bleh') $$);
+-- since the error messages/warnings from this COMMIT varies between
+-- platforms/environments we remove it from test output and show SQLSTATE instead.
+-- SQLSTATE should be 00000 successful_completion
+--<exclude_from_test>
 COMMIT;
+--</exclude_from_test>
+\echo 'COMMIT SQLSTATE' :SQLSTATE
 
 SELECT node_name, connection_status, transaction_status, transaction_depth, processing
 FROM _timescaledb_internal.show_connection_cache() ORDER BY 1,4;
@@ -299,7 +333,14 @@ FROM _timescaledb_internal.show_connection_cache() ORDER BY 1,4;
 BEGIN;
     SELECT remote_node_killer_set_event('waiting-commit-prepared','loopback');
     SELECT test.remote_exec('{loopback}', $$ INSERT INTO "S 1"."T 1" VALUES (10005,1,'bleh', '2001-01-01', '2001-01-01', 'bleh') $$);
+-- since the error messages/warnings from this COMMIT varies between
+-- platforms/environments we remove it from test output and show SQLSTATE instead.
+-- SQLSTATE should be 00000 successful_completion
+--<exclude_from_test>
 COMMIT;
+--</exclude_from_test>
+\echo 'COMMIT SQLSTATE' :SQLSTATE
+
 --at this point the commit prepared might or might not have been executed before
 --the data node process was killed.
 --but in any case, healing the server will bring it into a known state

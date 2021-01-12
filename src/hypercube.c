@@ -172,25 +172,33 @@ ts_hypercube_from_constraints(ChunkConstraints *constraints, MemoryContext mctx)
 	for (i = 0; i < constraints->num_constraints; i++)
 	{
 		ChunkConstraint *cc = chunk_constraints_get(constraints, i);
+		ScanTupLock tuplock = {
+			.lockmode = LockTupleKeyShare,
+			.waitpolicy = LockWaitBlock,
+#if PG12_GE
+			.lockflags = TUPLE_LOCK_FLAG_FIND_LAST_VERSION,
+#endif
+		};
 
 		if (is_dimension_constraint(cc))
 		{
 			DimensionSlice *slice;
-			ScanTupLock tuplock = {
-				.lockmode = LockTupleKeyShare,
-				.waitpolicy = LockWaitBlock,
-#if PG12_GE
-				.lockflags = TUPLE_LOCK_FLAG_FIND_LAST_VERSION,
-#endif
-			};
+			ScanTupLock *const tuplock_ptr = RecoveryInProgress() ? NULL : &tuplock;
 
 			Assert(hc->num_slices < constraints->num_dimension_constraints);
+
 			/* When building the hypercube, we reference the dimension slices
-			 * to construct the hypercube. This means that we need to add a
-			 * tuple lock on the dimension slices to prevent them from being
-			 * removed by a concurrently executing operation. */
-			slice =
-				ts_dimension_slice_scan_by_id_and_lock(cc->fd.dimension_slice_id, &tuplock, mctx);
+			 * to construct the hypercube.
+			 *
+			 * However, we cannot add a tuple lock when running in recovery
+			 * mode since that prevents SELECT statements (which reach this
+			 * point) from running on a read-only secondary (which runs in
+			 * ephemeral recovery mode), so we only take the lock if we are not
+			 * in recovery mode.
+			 */
+			slice = ts_dimension_slice_scan_by_id_and_lock(cc->fd.dimension_slice_id,
+														   tuplock_ptr,
+														   mctx);
 			Assert(slice != NULL);
 			hc->slices[hc->num_slices++] = slice;
 		}
@@ -201,6 +209,35 @@ ts_hypercube_from_constraints(ChunkConstraints *constraints, MemoryContext mctx)
 	Assert(hypercube_is_sorted(hc));
 
 	return hc;
+}
+
+/*
+ * Find slices in the hypercube that already exists in metadata.
+ *
+ * If a slice exists in metadata, the slice ID will be filled in on the
+ * existing slice in the hypercube. Optionally, also lock the slice when
+ * found.
+ */
+int
+ts_hypercube_find_existing_slices(Hypercube *cube, ScanTupLock *tuplock)
+{
+	int i;
+	int num_found = 0;
+
+	for (i = 0; i < cube->num_slices; i++)
+	{
+		/*
+		 * Check if there's already an existing slice with the calculated
+		 * range. If a slice already exists, use that slice's ID instead
+		 * of a new one.
+		 */
+		bool found = ts_dimension_slice_scan_for_existing(cube->slices[i], tuplock);
+
+		if (found)
+			num_found++;
+	}
+
+	return num_found;
 }
 
 /*
@@ -270,11 +307,8 @@ ts_hypercube_calculate_from_point(Hyperspace *hs, Point *p, ScanTupLock *tuplock
 			 * Check if there's already an existing slice with the calculated
 			 * range. If a slice already exists, use that slice's ID instead
 			 * of a new one.
-			 *
-			 * The tuples are already locked in
-			 * `chunk_create_from_point_after_lock`, so nothing to do here.
 			 */
-			ts_dimension_slice_scan_for_existing(cube->slices[i]);
+			ts_dimension_slice_scan_for_existing(cube->slices[i], tuplock);
 		}
 	}
 

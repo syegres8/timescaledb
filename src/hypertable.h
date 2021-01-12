@@ -26,9 +26,24 @@ typedef struct SubspaceStore SubspaceStore;
 typedef struct Chunk Chunk;
 typedef struct Hypercube Hypercube;
 
-#define TS_HYPERTABLE_HAS_COMPRESSION(ht)                                                          \
-	((ht)->fd.compressed_hypertable_id != INVALID_HYPERTABLE_ID)
+/* For the distributed node case, we would have compression enabled
+ * but don't have a corresponding internal table on the access
+ * node
+ */
+enum
+{
+	HypertableCompressionOff = 0,
+	HypertableCompressionEnabled = 1,
+	HypertableInternalCompressionTable = 2,
+};
 
+#define TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) ts_hypertable_has_compression_table(ht)
+
+#define TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht)                                                  \
+	((ht)->fd.compression_state == HypertableCompressionEnabled)
+
+#define TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht)                                            \
+	((ht)->fd.compression_state == HypertableInternalCompressionTable)
 typedef struct Hypertable
 {
 	FormData_hypertable fd;
@@ -36,8 +51,6 @@ typedef struct Hypertable
 	Oid chunk_sizing_func;
 	Hyperspace *space;
 	SubspaceStore *chunk_cache;
-	int64 max_ignore_invalidation_older_than; /* lazy-loaded, do not access directly, use
-											ts_hypertable_get_ignore_invalidation_older_than */
 	/*
 	 * Allows restricting the data nodes to use for the hypertable. Default is to
 	 * use all available data nodes.
@@ -116,11 +129,11 @@ extern TSDLLEXPORT int ts_hypertable_update(Hypertable *ht);
 extern int ts_hypertable_set_name(Hypertable *ht, const char *newname);
 extern int ts_hypertable_set_schema(Hypertable *ht, const char *newname);
 extern int ts_hypertable_set_num_dimensions(Hypertable *ht, int16 num_dimensions);
-extern TSDLLEXPORT int64 ts_hypertable_get_max_ignore_invalidation_older_than(Hypertable *ht);
 extern int ts_hypertable_delete_by_name(const char *schema_name, const char *table_name);
+extern int ts_hypertable_delete_by_id(int32 hypertable_id);
 extern TSDLLEXPORT ObjectAddress ts_hypertable_create_trigger(Hypertable *ht, CreateTrigStmt *stmt,
 															  const char *query);
-extern TSDLLEXPORT void ts_hypertable_drop_trigger(Hypertable *ht, const char *trigger_name);
+extern TSDLLEXPORT void ts_hypertable_drop_trigger(Oid relid, const char *trigger_name);
 extern TSDLLEXPORT void ts_hypertable_drop(Hypertable *hypertable, DropBehavior behavior);
 
 extern TSDLLEXPORT void ts_hypertable_check_partitioning(Hypertable *ht,
@@ -140,9 +153,9 @@ extern Tablespace *ts_hypertable_get_tablespace_at_offset_from(int32 hypertable_
 extern bool ts_hypertable_has_chunks(Oid table_relid, LOCKMODE lockmode);
 extern void ts_hypertables_rename_schema_name(const char *old_name, const char *new_name);
 extern bool ts_is_partitioning_column(Hypertable *ht, Index column_attno);
-extern TSDLLEXPORT bool ts_hypertable_set_compressed_id(Hypertable *ht,
-														int32 compressed_hypertable_id);
-extern TSDLLEXPORT bool ts_hypertable_unset_compressed_id(Hypertable *ht);
+extern TSDLLEXPORT bool ts_hypertable_set_compressed(Hypertable *ht,
+													 int32 compressed_hypertable_id);
+extern TSDLLEXPORT bool ts_hypertable_unset_compressed(Hypertable *ht);
 extern TSDLLEXPORT void ts_hypertable_clone_constraints_to_compressed(Hypertable *ht,
 																	  List *constraint_list);
 extern List *ts_hypertable_assign_chunk_data_nodes(Hypertable *ht, Hypercube *cube);
@@ -156,6 +169,10 @@ extern TSDLLEXPORT void ts_hypertable_func_call_on_data_nodes(Hypertable *ht,
 															  FunctionCallInfo fcinfo);
 extern TSDLLEXPORT int16 ts_validate_replication_factor(int32 replication_factor, bool is_null,
 														bool is_dist_call);
+extern TSDLLEXPORT Datum ts_hypertable_get_open_dim_max_value(const Hypertable *ht,
+															  int dimension_index, bool *isnull);
+
+extern TSDLLEXPORT bool ts_hypertable_has_compression_table(Hypertable *ht);
 
 #define hypertable_scan(schema, table, tuple_found, data, lockmode, tuplock)                       \
 	ts_hypertable_scan_with_memory_context(schema,                                                 \

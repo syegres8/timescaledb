@@ -20,10 +20,7 @@
 typedef enum ContinuousAggViewOption
 {
 	ContinuousEnabled = 0,
-	ContinuousViewOptionRefreshLag,
-	ContinuousViewOptionMaxIntervalPerRun,
 	ContinuousViewOptionCreateGroupIndex,
-	ContinuousViewOptionIgnoreInvalidationOlderThan,
 	ContinuousViewOptionMaterializedOnly,
 } ContinuousAggViewOption;
 
@@ -32,7 +29,7 @@ typedef enum ContinuousAggViewType
 	ContinuousAggUserView = 0,
 	ContinuousAggPartialView,
 	ContinuousAggDirectView,
-	ContinuousAggNone
+	ContinuousAggAnyView
 } ContinuousAggViewType;
 
 extern TSDLLEXPORT WithClauseResult *ts_continuous_agg_with_clause_parse(const List *defelems);
@@ -40,6 +37,7 @@ extern TSDLLEXPORT WithClauseResult *ts_continuous_agg_with_clause_parse(const L
 typedef struct ContinuousAgg
 {
 	FormData_continuous_agg data;
+	Oid relid;
 } ContinuousAgg;
 
 typedef enum ContinuousAggHypertableStatus
@@ -65,17 +63,9 @@ ts_continuous_agg_find_by_mat_hypertable_id(int32 mat_hypertable_id);
 extern TSDLLEXPORT ContinuousAggHypertableStatus
 ts_continuous_agg_hypertable_status(int32 hypertable_id);
 extern TSDLLEXPORT List *ts_continuous_aggs_find_by_raw_table_id(int32 raw_hypertable_id);
-extern TSDLLEXPORT int64 ts_continuous_aggs_max_ignore_invalidation_older_than(
-	int32 raw_hypertable_id, FormData_continuous_agg *entry);
-TSDLLEXPORT int64 ts_continuous_aggs_min_completed_threshold(int32 raw_hypertable_id,
-															 FormData_continuous_agg *entry);
-extern TSDLLEXPORT int64 ts_continuous_aggs_get_minimum_invalidation_time(
-	int64 modification_time, int64 ignore_invalidation_older_than);
-TSDLLEXPORT
-int64 ts_continuous_agg_get_completed_threshold(int32 materialization_id);
-
 extern TSDLLEXPORT ContinuousAgg *ts_continuous_agg_find_by_view_name(const char *schema,
-																	  const char *name);
+																	  const char *name,
+																	  ContinuousAggViewType type);
 extern TSDLLEXPORT ContinuousAgg *ts_continuous_agg_find_by_relid(Oid relid);
 extern TSDLLEXPORT ContinuousAgg *ts_continuous_agg_find_by_rv(const RangeVar *rv);
 

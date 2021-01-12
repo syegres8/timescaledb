@@ -99,8 +99,27 @@ ts_dimension_slice_cmp_coordinate(const DimensionSlice *slice, int64 coord)
 	return 0;
 }
 
+static bool
+tuple_is_deleted(TupleInfo *ti)
+{
+#if PG12_GE
+#ifdef USE_ASSERT_CHECKING
+	if (ti->lockresult == TM_Deleted)
+		Assert(ItemPointerEquals(ts_scanner_get_tuple_tid(ti), &ti->lockfd.ctid));
+#endif
+	return ti->lockresult == TM_Deleted;
+#else
+	/* If the tid and ctid in the lock failure data is the same, then this is
+	 * a delete. Otherwise it is an update and ctid is the new tuple ID. This
+	 * applies mostly to PG11, since PG12 has an explicit lockresult for
+	 * deleted tuples. */
+	return ti->lockresult == TM_Updated &&
+		   ItemPointerEquals(ts_scanner_get_tuple_tid(ti), &ti->lockfd.ctid);
+#endif
+}
+
 static void
-lock_result_ok_or_abort(TupleInfo *ti, DimensionSlice *slice)
+lock_result_ok_or_abort(TupleInfo *ti)
 {
 	switch (ti->lockresult)
 	{
@@ -109,14 +128,14 @@ lock_result_ok_or_abort(TupleInfo *ti, DimensionSlice *slice)
 		case TM_SelfModified:
 		case TM_Ok:
 			break;
-
 #if PG12_GE
 		case TM_Deleted:
 #endif
 		case TM_Updated:
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("dimension slice %d locked by other transaction", slice->fd.id),
+					 errmsg("chunk %s by other transaction",
+							tuple_is_deleted(ti) ? "deleted" : "updated"),
 					 errhint("Retry the operation again.")));
 			pg_unreachable();
 			break;
@@ -124,16 +143,14 @@ lock_result_ok_or_abort(TupleInfo *ti, DimensionSlice *slice)
 		case TM_BeingModified:
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("dimension slice %d updated by other transaction", slice->fd.id),
+					 errmsg("chunk updated by other transaction"),
 					 errhint("Retry the operation again.")));
 			pg_unreachable();
 			break;
-
 		case TM_Invisible:
 			elog(ERROR, "attempt to lock invisible tuple");
 			pg_unreachable();
 			break;
-
 		case TM_WouldBlock:
 		default:
 			elog(ERROR, "unexpected tuple lock status: %d", ti->lockresult);
@@ -146,9 +163,26 @@ static ScanTupleResult
 dimension_vec_tuple_found(TupleInfo *ti, void *data)
 {
 	DimensionVec **slices = data;
-	DimensionSlice *slice = dimension_slice_from_slot(ti->slot);
+	DimensionSlice *slice;
 
-	lock_result_ok_or_abort(ti, slice);
+	switch (ti->lockresult)
+	{
+		case TM_SelfModified:
+		case TM_Ok:
+			break;
+#if PG12_GE
+		case TM_Deleted:
+#endif
+		case TM_Updated:
+			/* Treat as not found */
+			return SCAN_CONTINUE;
+		default:
+			elog(ERROR, "unexpected tuple lock status: %d", ti->lockresult);
+			pg_unreachable();
+			break;
+	}
+
+	slice = dimension_slice_from_slot(ti->slot);
 	*slices = ts_dimension_vec_add_slice(slices, slice);
 
 	return SCAN_CONTINUE;
@@ -524,14 +558,32 @@ ts_dimension_slice_delete_by_id(int32 dimension_slice_id, bool delete_constraint
 static ScanTupleResult
 dimension_slice_fill(TupleInfo *ti, void *data)
 {
-	DimensionSlice **slice = data;
-	bool should_free;
-	HeapTuple tuple = ts_scanner_fetch_heap_tuple(ti, false, &should_free);
+	switch (ti->lockresult)
+	{
+		case TM_SelfModified:
+		case TM_Ok:
+		{
+			DimensionSlice **slice = data;
+			bool should_free;
+			HeapTuple tuple = ts_scanner_fetch_heap_tuple(ti, false, &should_free);
 
-	memcpy(&(*slice)->fd, GETSTRUCT(tuple), sizeof(FormData_dimension_slice));
+			memcpy(&(*slice)->fd, GETSTRUCT(tuple), sizeof(FormData_dimension_slice));
 
-	if (should_free)
-		heap_freetuple(tuple);
+			if (should_free)
+				heap_freetuple(tuple);
+			break;
+		}
+#if PG12_GE
+		case TM_Deleted:
+#endif
+		case TM_Updated:
+			/* Same as not found */
+			break;
+		default:
+			elog(ERROR, "unexpected tuple lock status: %d", ti->lockresult);
+			pg_unreachable();
+			break;
+	}
 
 	return SCAN_DONE;
 }
@@ -545,7 +597,7 @@ dimension_slice_fill(TupleInfo *ti, void *data)
  * otherwise.
  */
 bool
-ts_dimension_slice_scan_for_existing(DimensionSlice *slice)
+ts_dimension_slice_scan_for_existing(DimensionSlice *slice, ScanTupLock *tuplock)
 {
 	ScanKeyData scankey[3];
 
@@ -573,7 +625,7 @@ ts_dimension_slice_scan_for_existing(DimensionSlice *slice)
 		&slice,
 		1,
 		AccessShareLock,
-		NULL,
+		tuplock,
 		CurrentMemoryContext);
 }
 
@@ -583,7 +635,7 @@ dimension_slice_tuple_found(TupleInfo *ti, void *data)
 	DimensionSlice **slice = data;
 	MemoryContext old;
 
-	lock_result_ok_or_abort(ti, *slice);
+	lock_result_ok_or_abort(ti);
 
 	old = MemoryContextSwitchTo(ti->mctx);
 	*slice = dimension_slice_from_slot(ti->slot);
@@ -747,7 +799,11 @@ dimension_slice_insert_relation(Relation rel, DimensionSlice *slice)
 /*
  * Insert slices into the catalog.
  *
- * Only slices that don't already exists in the catalog will be inserted.
+ * Only slices that don't already exist in the catalog will be inserted. Note
+ * that all slices that already exist (i.e., have a valid ID) MUST be locked
+ * with a tuple lock (e.g., FOR KEY SHARE) prior to calling this function
+ * since they won't be created. Otherwise it is not possible to guarantee that
+ * all slices still exist once the transaction commits.
  *
  * Returns the number of slices inserted.
  */
@@ -762,9 +818,6 @@ ts_dimension_slice_insert_multi(DimensionSlice **slices, Size num_slices)
 
 	for (i = 0; i < num_slices; i++)
 	{
-		slices[i]->fd.id = 0;
-		ts_dimension_slice_scan_for_existing(slices[i]);
-
 		if (slices[i]->fd.id == 0)
 		{
 			dimension_slice_insert_relation(rel, slices[i]);

@@ -24,7 +24,6 @@
 #include "compression/segment_meta.h"
 #include "continuous_aggs/create.h"
 #include "continuous_aggs/insert.h"
-#include "continuous_aggs/materialize.h"
 #include "continuous_aggs/options.h"
 #include "continuous_aggs/refresh.h"
 #include "continuous_aggs/invalidation.h"
@@ -36,7 +35,6 @@
 #include "fdw/fdw.h"
 #include "hypertable.h"
 #include "license_guc.h"
-#include "license.h"
 #include "nodes/decompress_chunk/planner.h"
 #include "nodes/gapfill/gapfill.h"
 #include "partialize_finalize.h"
@@ -64,10 +62,6 @@ PG_MODULE_MAGIC;
 extern void PGDLLEXPORT _PG_init(void);
 extern void PGDLLEXPORT _PG_fini(void);
 
-static void module_shutdown(void);
-static bool enterprise_enabled_internal(void);
-static bool check_tsl_loaded(void);
-
 static void
 cache_syscache_invalidate(Datum arg, int cacheid, uint32 hashvalue)
 {
@@ -85,14 +79,7 @@ cache_syscache_invalidate(Datum arg, int cacheid, uint32 hashvalue)
  * Apache codebase.
  */
 CrossModuleFunctions tsl_cm_functions = {
-	.tsl_license_on_assign = tsl_license_on_assign,
-	.enterprise_enabled_internal = enterprise_enabled_internal,
-	.check_tsl_loaded = check_tsl_loaded,
-	.license_end_time = license_end_time,
-	.print_tsl_license_expiration_info_hook = license_print_expiration_info,
-	.module_shutdown_hook = module_shutdown,
 	.add_tsl_telemetry_info = tsl_telemetry_add_info,
-	.continuous_agg_materialize = continuous_agg_materialize,
 
 	.create_upper_paths_hook = tsl_create_upper_paths_hook,
 	.set_rel_pathlist_dml = tsl_set_rel_pathlist_dml,
@@ -136,6 +123,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.continuous_agg_invalidation_trigger = continuous_agg_trigfn,
 	.continuous_agg_update_options = continuous_agg_update_options,
 	.continuous_agg_refresh = continuous_agg_refresh,
+	.continuous_agg_refresh_chunk = continuous_agg_refresh_chunk,
 	.continuous_agg_invalidate = invalidation_add_entry,
 	.compressed_data_decompress_forward = tsl_compressed_data_decompress_forward,
 	.compressed_data_decompress_reverse = tsl_compressed_data_decompress_reverse,
@@ -194,6 +182,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.chunk_get_colstats = chunk_api_get_chunk_colstats,
 	.hypertable_distributed_set_replication_factor = hypertable_set_replication_factor,
 	.cache_syscache_invalidate = cache_syscache_invalidate,
+	.update_compressed_chunk_relstats = update_compressed_chunk_relstats,
 };
 
 TS_FUNCTION_INFO_V1(ts_module_init);
@@ -214,39 +203,7 @@ ts_module_init(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(true);
 }
 
-/*
- * Currently we disallow shutting down this submodule in a live session,
- * but if we did, this would be the function we'd use.
- */
-static void
-module_shutdown(void)
-{
-	_continuous_aggs_cache_inval_fini();
-
-	/*
-	 * Order of items should be strict reverse order of ts_module_init. Please
-	 * document any exceptions.
-	 */
-	_remote_dist_txn_fini();
-	_remote_connection_cache_fini();
-	_tsl_process_utility_fini();
-
-	ts_cm_functions = &ts_cm_functions_default;
-}
-
 /* Informative functions */
-
-static bool
-enterprise_enabled_internal(void)
-{
-	return license_enterprise_enabled();
-}
-
-static bool
-check_tsl_loaded(void)
-{
-	return true;
-}
 
 PGDLLEXPORT void
 _PG_init(void)
@@ -256,7 +213,7 @@ _PG_init(void)
 	 * timescale library is loaded, after which we enable it from the loader.
 	 * In parallel workers the restore shared libraries function will load the
 	 * libraries itself, and we bypass the loader, so we need to ensure that
-	 * timescale is aware it can  use the tsl if needed. It is always safe to
+	 * timescale is aware it can use the tsl if needed. It is always safe to
 	 * do this here, because if we reach this point, we must have already
 	 * loaded the tsl, so we no longer need to worry about its load order
 	 * relative to the other libraries.

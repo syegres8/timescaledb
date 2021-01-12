@@ -127,8 +127,6 @@ static uint64
 copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*callback)(void *),
 		 void *arg)
 {
-	Datum *values;
-	bool *nulls;
 	ResultRelInfo *resultRelInfo;
 	ResultRelInfo *saved_resultRelInfo = NULL;
 	EState *estate = ccstate->estate; /* for ExecConstraints() */
@@ -274,9 +272,6 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 	 * EACH ROW triggers that we already fire on COPY.
 	 */
 	ExecBSInsertTriggers(estate, resultRelInfo);
-
-	values = (Datum *) palloc(RelationGetDescr(ccstate->rel)->natts * sizeof(Datum));
-	nulls = (bool *) palloc(RelationGetDescr(ccstate->rel)->natts * sizeof(bool));
 
 	bistate = GetBulkInsertState();
 	econtext = GetPerTupleExprContext(estate);
@@ -440,16 +435,11 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 	/* Handle queued AFTER triggers */
 	AfterTriggerEndQuery(estate);
 
-	pfree(values);
-	pfree(nulls);
-
 	ExecResetTupleTable(estate->es_tupleTable, false);
 
 	ExecCloseIndices(resultRelInfo);
 	/* Close any trigger target relations */
 	ExecCleanUpTriggerState(estate);
-
-	copy_chunk_state_destroy(ccstate);
 
 	/*
 	 * If we skipped writing WAL, then we need to sync the heap (but not
@@ -545,7 +535,12 @@ copy_constraints_and_check(ParseState *pstate, Relation rel, List *attnums)
 {
 	ListCell *cur;
 	char *xactReadOnly;
-#if PG12_GE
+#if PG13_GE
+	ParseNamespaceItem *nsitem =
+		addRangeTableEntryForRelation(pstate, rel, RowExclusiveLock, NULL, false, false);
+	RangeTblEntry *rte = nsitem->p_rte;
+	addNSItemToQuery(pstate, nsitem, true, true, true);
+#elif PG12
 	RangeTblEntry *rte =
 		addRangeTableEntryForRelation(pstate, rel, RowExclusiveLock, NULL, false, false);
 	addRTEtoQuery(pstate, rte, false, true, true);
@@ -671,10 +666,11 @@ timescaledb_DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *proces
 	ccstate->where_clause = where_clause;
 
 	if (hypertable_is_distributed(ht))
-		ts_cm_functions->distributed_copy(stmt, processed, ccstate, attnums);
+		*processed = ts_cm_functions->distributed_copy(stmt, ccstate, attnums);
 	else
 		*processed = copyfrom(ccstate, pstate->p_rtable, ht, CopyFromErrorCallback, cstate);
 
+	copy_chunk_state_destroy(ccstate);
 	EndCopyFrom(cstate);
 	free_parsestate(pstate);
 	table_close(rel, NoLock);
@@ -740,6 +736,7 @@ timescaledb_move_from_table_to_chunks(Hypertable *ht, LOCKMODE lockmode)
 	scandesc = table_beginscan(rel, snapshot, 0, NULL);
 	ccstate = copy_chunk_state_create(ht, rel, next_copy_from_table_to_chunks, NULL, scandesc);
 	copyfrom(ccstate, pstate->p_rtable, ht, copy_table_to_chunk_error_callback, scandesc);
+	copy_chunk_state_destroy(ccstate);
 	heap_endscan(scandesc);
 	UnregisterSnapshot(snapshot);
 	table_close(rel, lockmode);

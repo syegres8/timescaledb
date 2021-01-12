@@ -8,6 +8,9 @@
 CREATE OR REPLACE FUNCTION ts_bgw_params_create() RETURNS VOID
 AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
 
+CREATE OR REPLACE FUNCTION test.continuous_aggs_find_view(cagg REGCLASS) RETURNS VOID
+AS :TSL_MODULE_PATHNAME, 'ts_test_continuous_agg_find_by_view_name' LANGUAGE C;
+
 \set WAIT_ON_JOB 0
 \set IMMEDIATELY_SET_UNTIL 1
 \set WAIT_FOR_OTHER_TO_ADVANCE 2
@@ -43,9 +46,10 @@ WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 as
 select a, count(b)
 from foo
-group by time_bucket(1, a), a;
+group by time_bucket(1, a), a WITH NO DATA;
 
-SELECT add_refresh_continuous_aggregate_policy('mat_m1', NULL, 2::integer, '12 h'::interval); 
+SELECT add_continuous_aggregate_policy('mat_m1', NULL, 2::integer, '12 h'::interval) AS job_id
+\gset
 SELECT * FROM _timescaledb_config.bgw_job;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
@@ -102,7 +106,7 @@ WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 as
 select time_bucket('1day', timec), min(location), sum(temperature),sum(humidity)
 from conditions
-group by time_bucket('1day', timec);
+group by time_bucket('1day', timec) WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -113,6 +117,11 @@ FROM _timescaledb_catalog.continuous_agg ca
 INNER JOIN _timescaledb_catalog.hypertable h ON(h.id = ca.mat_hypertable_id)
 WHERE user_view_name = 'mat_m1'
 \gset
+
+-- Materialized hypertable for mat_m1 should not be visible in the
+-- hypertables view:
+SELECT hypertable_schema, hypertable_name
+FROM timescaledb_information.hypertables ORDER BY 1,2;
 
 SET ROLE :ROLE_SUPERUSER;
 insert into  :"MAT_SCHEMA_NAME".:"MAT_TABLE_NAME"
@@ -164,7 +173,7 @@ as
 select time_bucket('1week', timec) ,
 min(location), sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
-group by time_bucket('1week', timec) ;
+group by time_bucket('1week', timec)  WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -211,7 +220,7 @@ min(location), sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
 where location = 'NYC'
 group by time_bucket('1week', timec)
-;
+ WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -256,7 +265,7 @@ select time_bucket('1week', timec) ,
 min(location), sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
 group by time_bucket('1week', timec)
-having stddev(humidity) is not null;
+having stddev(humidity) is not null WITH NO DATA;
 ;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
@@ -320,7 +329,7 @@ as
 select time_bucket('1week', timec) as bucket, location as loc, sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
 group by bucket, loc
-having min(location) >= 'NYC' and avg(temperature) > 20;
+having min(location) >= 'NYC' and avg(temperature) > 20 WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -346,7 +355,7 @@ as
 select time_bucket('1week', timec), location, sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
 group by 1,2
-having min(location) >= 'NYC' and avg(temperature) > 20;
+having min(location) >= 'NYC' and avg(temperature) > 20 WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -372,7 +381,7 @@ as
 select time_bucket('1week', timec), location, sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
 group by 1,2
-having min(location) >= 'NYC' and avg(temperature) > 20;
+having min(location) >= 'NYC' and avg(temperature) > 20 WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -398,7 +407,7 @@ select time_bucket('1week', timec) ,
 min(location), sum(temperature)+sum(humidity), stddev(humidity)
 from conditions
 group by  time_bucket('1week', timec)
-having min(location) >= 'NYC' and avg(temperature) > 20;
+having min(location) >= 'NYC' and avg(temperature) > 20 WITH NO DATA;
 
 SELECT ca.raw_hypertable_id as "RAW_HYPERTABLE_ID",
        h.schema_name AS "MAT_SCHEMA_NAME",
@@ -565,7 +574,7 @@ WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 as
 select time_bucket('1day', timec), min(location), sum(temperature),sum(humidity)
 from conditions
-group by time_bucket('1day', timec);
+group by time_bucket('1day', timec) WITH NO DATA;
 
 \set ON_ERROR_STOP 0
 DROP TABLE conditions;
@@ -592,15 +601,13 @@ WHERE user_view_name = 'mat_drop_test'
 \gset
 
 SET client_min_messages TO LOG;
-SET timescaledb.current_timestamp_mock = '2018-12-31 00:00';
-REFRESH MATERIALIZED VIEW mat_drop_test;
+CALL refresh_continuous_aggregate('mat_drop_test', NULL, NULL);
 
 --force invalidation
 insert into conditions
 select generate_series('2017-11-01 00:00'::timestamp, '2017-12-15 00:00'::timestamp, '1 day'), 'LA', 73, 55, NULL, 28, NULL;
 
 select count(*) from _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-select count(*) from _timescaledb_catalog.continuous_aggs_completed_threshold;
 select count(*) from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
 
 DROP TABLE conditions CASCADE;
@@ -610,7 +617,6 @@ SELECT count(*)
 FROM _timescaledb_catalog.continuous_agg ca
 WHERE user_view_name = 'mat_drop_test';
 select count(*) from _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-select count(*) from _timescaledb_catalog.continuous_aggs_completed_threshold;
 select count(*) from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
 select count(*) from _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
 
@@ -636,20 +642,18 @@ CREATE TABLE conditions (
 select table_name from create_hypertable( 'conditions', 'timec');
 
 CREATE MATERIALIZED VIEW mat_with_test(timec, minl, sumt , sumh)
-WITH ( timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '5 hours')
+WITH (timescaledb.continuous,
+      timescaledb.materialized_only=true)
 as
 select time_bucket('1day', timec), min(location), sum(temperature),sum(humidity)
 from conditions
-group by time_bucket('1day', timec), location, humidity, temperature;
+group by time_bucket('1day', timec), location, humidity, temperature WITH NO DATA;
 
-SELECT add_refresh_continuous_aggregate_policy('mat_with_test', NULL, '5 h'::interval, '12 h'::interval); 
+SELECT add_continuous_aggregate_policy('mat_with_test', NULL, '5 h'::interval, '12 h'::interval);
 SELECT alter_job(id, schedule_interval => '1h') FROM _timescaledb_config.bgw_job;
 SELECT schedule_interval FROM _timescaledb_config.bgw_job;
-SELECT _timescaledb_internal.to_interval(refresh_lag) FROM _timescaledb_catalog.continuous_agg WHERE user_view_name = 'mat_with_test';
 
-ALTER MATERIALIZED VIEW mat_with_test SET(timescaledb.refresh_lag = '6 h');
 SELECT alter_job(id, schedule_interval => '2h') FROM _timescaledb_config.bgw_job;
-SELECT _timescaledb_internal.to_interval(refresh_lag) FROM _timescaledb_catalog.continuous_agg WHERE user_view_name = 'mat_with_test';
 SELECT schedule_interval FROM _timescaledb_config.bgw_job;
 
 select indexname, indexdef from pg_indexes where tablename =
@@ -662,11 +666,13 @@ order by indexname;
 DROP MATERIALIZED VIEW mat_with_test;
 --no additional indexes
 CREATE MATERIALIZED VIEW mat_with_test(timec, minl, sumt , sumh)
-WITH (timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '5 hours', timescaledb.create_group_indexes=false)
+WITH (timescaledb.continuous,
+      timescaledb.materialized_only=true,
+      timescaledb.create_group_indexes=false)
 as
 select time_bucket('1day', timec), min(location), sum(temperature),sum(humidity)
 from conditions
-group by time_bucket('1day', timec), location, humidity, temperature;
+group by time_bucket('1day', timec), location, humidity, temperature WITH NO DATA;
 
 select indexname, indexdef from pg_indexes where tablename =
 (SELECT h.table_name
@@ -693,24 +699,17 @@ CREATE OR REPLACE FUNCTION integer_now_conditions() returns int LANGUAGE SQL STA
 SELECT set_integer_now_func('conditions', 'integer_now_conditions');
 
 CREATE MATERIALIZED VIEW mat_with_test(timec, minl, sumt , sumh)
-WITH (timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '500')
+WITH (timescaledb.continuous,
+      timescaledb.materialized_only=true)
 as
 select time_bucket(100, timec), min(location), sum(temperature),sum(humidity)
 from conditions
-group by time_bucket(100, timec);
+group by time_bucket(100, timec) WITH NO DATA;
 
-SELECT add_refresh_continuous_aggregate_policy('mat_with_test', NULL, 500::integer, '12 h'::interval); 
+SELECT add_continuous_aggregate_policy('mat_with_test', NULL, 500::integer, '12 h'::interval);
 SELECT alter_job(id, schedule_interval => '2h') FROM _timescaledb_config.bgw_job;
 
 SELECT schedule_interval FROM _timescaledb_config.bgw_job;
-SELECT refresh_lag FROM _timescaledb_catalog.continuous_agg WHERE user_view_name = 'mat_with_test';
-
-ALTER MATERIALIZED VIEW mat_with_test SET(timescaledb.refresh_lag = '100');
-SELECT refresh_lag FROM _timescaledb_catalog.continuous_agg WHERE user_view_name = 'mat_with_test';
-
--- we can SET multiple options in one commad
-ALTER MATERIALIZED VIEW mat_with_test SET (timescaledb.refresh_lag = '100', timescaledb.max_interval_per_job='400');
-SELECT refresh_lag, max_interval_per_job FROM _timescaledb_catalog.continuous_agg WHERE user_view_name = 'mat_with_test';
 
 DROP TABLE conditions CASCADE;
 
@@ -733,10 +732,11 @@ CREATE OR REPLACE FUNCTION integer_now_space_table() returns BIGINT LANGUAGE SQL
 SELECT set_integer_now_func('space_table', 'integer_now_space_table');
 
 CREATE MATERIALIZED VIEW space_view
-WITH (timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '-2')
+WITH (timescaledb.continuous,
+      timescaledb.materialized_only=true)
 AS SELECT time_bucket('4', time), COUNT(data)
    FROM space_table
-   GROUP BY 1;
+   GROUP BY 1 WITH NO DATA;
 
 INSERT INTO space_table VALUES
   (0, 1, 1), (0, 2, 1), (1, 1, 1), (1, 2, 1),
@@ -757,7 +757,7 @@ SELECT * FROM :"MAT_SCHEMA_NAME".:"MAT_TABLE_NAME"
   ORDER BY time_bucket, chunk_id;
 
 
-REFRESH MATERIALIZED VIEW space_view;
+CALL refresh_continuous_aggregate('space_view', NULL, NULL);
 
 SELECT * FROM space_view ORDER BY 1;
 
@@ -767,7 +767,7 @@ SELECT * FROM :"MAT_SCHEMA_NAME".:"MAT_TABLE_NAME"
 
 INSERT INTO space_table VALUES (3, 2, 1);
 
-REFRESH MATERIALIZED VIEW space_view;
+CALL refresh_continuous_aggregate('space_view', NULL, NULL);
 
 SELECT * FROM space_view ORDER BY 1;
 
@@ -777,7 +777,7 @@ SELECT * FROM :"MAT_SCHEMA_NAME".:"MAT_TABLE_NAME"
 
 INSERT INTO space_table VALUES (2, 3, 1);
 
-REFRESH MATERIALIZED VIEW space_view;
+CALL refresh_continuous_aggregate('space_view', NULL, NULL);
 
 SELECT * FROM space_view ORDER BY 1;
 
@@ -839,110 +839,186 @@ select generate_series(0, 200, 10), 'POR', 55, 75, 40, 70, NULL;
 
 
 CREATE MATERIALIZED VIEW mat_ffunc_test
-WITH (timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '-200')
+WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 as
 select time_bucket(100, timec), aggregate_to_test_ffunc_extra(timec, 1, 3, 'test'::text)
 from conditions
 group by time_bucket(100, timec);
-
-REFRESH MATERIALIZED VIEW mat_ffunc_test;
 
 SELECT * FROM mat_ffunc_test;
 
 DROP MATERIALIZED view mat_ffunc_test;
 
 CREATE MATERIALIZED VIEW mat_ffunc_test
-WITH (timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '-200')
+WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 as
 select time_bucket(100, timec), aggregate_to_test_ffunc_extra(timec, 4, 5, bigint '123')
 from conditions
 group by time_bucket(100, timec);
-
-REFRESH MATERIALIZED VIEW mat_ffunc_test;
 
 SELECT * FROM mat_ffunc_test;
 
 --refresh mat view test when time_bucket is not projected --
 DROP MATERIALIZED VIEW mat_ffunc_test;
 CREATE MATERIALIZED VIEW mat_refresh_test
-WITH (timescaledb.continuous, timescaledb.materialized_only=true, timescaledb.refresh_lag = '-200')
+WITH (timescaledb.continuous, timescaledb.materialized_only=true)
 as
 select location, max(humidity)
 from conditions
-group by time_bucket(100, timec), location;
+group by time_bucket(100, timec), location WITH NO DATA;
 
 insert into conditions
 select generate_series(0, 50, 10), 'NYC', 55, 75, 40, 70, NULL;
 
-REFRESH MATERIALIZED VIEW mat_refresh_test;
+CALL refresh_continuous_aggregate('mat_refresh_test', NULL, NULL);
 SELECT * FROM mat_refresh_test order by 1,2 ;
 
 -- test for bug when group by is not in project list
-CREATE MATERIALIZED VIEW conditions_grpby_view with (timescaledb.continuous, timescaledb.refresh_lag = '-200') as 
-select time_bucket(100, timec),  sum(humidity) 
-from conditions 
+CREATE MATERIALIZED VIEW conditions_grpby_view with (timescaledb.continuous) as
+select time_bucket(100, timec),  sum(humidity)
+from conditions
 group by time_bucket(100, timec), location;
-REFRESH MATERIALIZED VIEW conditions_grpby_view;
 select * from conditions_grpby_view order by 1, 2;
 
-CREATE MATERIALIZED VIEW conditions_grpby_view2 with (timescaledb.continuous, timescaledb.refresh_lag = '-200') as 
+CREATE MATERIALIZED VIEW conditions_grpby_view2 with (timescaledb.continuous) as
 select time_bucket(100, timec), sum(humidity)
 from conditions
-group by time_bucket(100, timec), location  
-having avg(temperature) > 0
-;
-REFRESH MATERIALIZED VIEW conditions_grpby_view2;
+group by time_bucket(100, timec), location
+having avg(temperature) > 0;
+
 select * from conditions_grpby_view2 order by 1, 2;
 
+-- Test internal functions for continuous aggregates
+SELECT test.continuous_aggs_find_view('mat_refresh_test');
 
---test ignore_invalidation_older_than on timestamps-based ht
-
-DROP TABLE conditions CASCADE;
-CREATE TABLE conditions (
-                            time       TIMESTAMPTZ       NOT NULL,
-                            temperature DOUBLE PRECISION  NULL
+-- Test pseudotype/enum handling
+CREATE TYPE status_enum AS ENUM (
+  'red',
+  'yellow',
+  'green'
 );
 
-select table_name from create_hypertable( 'conditions', 'time');
+CREATE TABLE cagg_types (
+  time TIMESTAMPTZ NOT NULL,
+  status status_enum,
+  names NAME[],
+  floats FLOAT[]
+);
 
-create materialized view mat_test5( timec, maxt)
-        WITH ( timescaledb.continuous, timescaledb.ignore_invalidation_older_than='30 day', timescaledb.refresh_lag='-1day',
-               timescaledb.max_interval_per_job='260 day')
-as
-select time_bucket('1day', time), max(temperature)
-from conditions
-group by time_bucket('1day', time);
+SELECT
+  table_name
+FROM
+  create_hypertable('cagg_types', 'time');
 
-SET timescaledb.current_timestamp_mock = '2001-03-11';
-insert into conditions values('2001-03-10', '1');
-insert into conditions values('2001-03-10', '2');
+INSERT INTO cagg_types
+SELECT
+  '2000-01-01',
+  'yellow',
+  '{foo,bar,baz}',
+  '{1,2.5,3}';
 
-REFRESH MATERIALIZED VIEW mat_test5;
-SELECT * FROM mat_test5;
+CREATE MATERIALIZED VIEW mat_types WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1d', time),
+  min(status) AS status,
+  max(names) AS names,
+  min(floats) AS floats
+FROM
+  cagg_types
+GROUP BY
+  1;
 
-insert into conditions values('2001-02-15', '1');
-insert into conditions values('2001-01-15', '1');
+CALL refresh_continuous_aggregate('mat_types',NULL,NULL);
+SELECT * FROM mat_types;
 
-REFRESH MATERIALIZED VIEW mat_test5;
---will see the feb but not the january change
-SELECT * FROM mat_test5;
+-------------------------------------------------------------------------------------
+-- Test issue #2616 where cagg view contains an experssion with several aggregates in
 
---what matters is the time at insertion not materialization
-SET timescaledb.current_timestamp_mock = '2001-03-11';
---will see this change
-insert into conditions values('2001-02-15', '3');
-SET timescaledb.current_timestamp_mock = '2001-05-11';
---but not this one
-insert into conditions values('2001-02-20', '4');
-REFRESH MATERIALIZED VIEW mat_test5;
-SELECT * FROM mat_test5;
---verify that watermark is limited by max value and not by
--- the current time (now value)--
-SET timescaledb.current_timestamp_mock = '2018-05-11';
-SELECT view_name, completed_threshold, invalidation_threshold 
-FROM timescaledb_information.continuous_aggregate_stats
-where view_name::text like 'mat_test5';
-REFRESH MATERIALIZED VIEW mat_test5;
-SELECT view_name, completed_threshold, invalidation_threshold 
-FROM timescaledb_information.continuous_aggregate_stats
-where view_name::text like 'mat_test5';
+CREATE TABLE water_consumption
+(
+    sensor_id   integer      NOT NULL,
+    timestamp   timestamp(0) NOT NULL,
+    water_index integer
+);
+
+SELECT create_hypertable('water_consumption', 'timestamp', 'sensor_id', 2);
+
+INSERT INTO public.water_consumption (sensor_id, timestamp, water_index) VALUES 
+  (1, '2010-11-03 09:42:30', 1030),
+  (1, '2010-11-03 09:42:40', 1032),
+  (1, '2010-11-03 09:42:50', 1035),
+  (1, '2010-11-03 09:43:30', 1040),
+  (1, '2010-11-03 09:43:40', 1045),
+  (1, '2010-11-03 09:43:50', 1050),
+  (1, '2010-11-03 09:44:30', 1052),
+  (1, '2010-11-03 09:44:40', 1057),
+  (1, '2010-11-03 09:44:50', 1060),
+  (1, '2010-11-03 09:45:30', 1063),
+  (1, '2010-11-03 09:45:40', 1067),
+  (1, '2010-11-03 09:45:50', 1070);
+
+-- The test with the view originally reported in the issue.
+CREATE MATERIALIZED VIEW water_consumption_aggregation_minute
+            WITH (timescaledb.continuous, timescaledb.materialized_only = TRUE)
+AS
+SELECT sensor_id,
+       time_bucket(INTERVAL '1 minute', timestamp) + '1 minute' AS timestamp,
+       (max(water_index) - min(water_index))                    AS water_consumption
+FROM water_consumption
+GROUP BY sensor_id, time_bucket(INTERVAL '1 minute', timestamp)
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('water_consumption_aggregation_minute', NULL, NULL);
+
+-- The results of the view and the query over hypertable should be the same
+SELECT * FROM water_consumption_aggregation_minute ORDER BY water_consumption;
+SELECT sensor_id,
+       time_bucket(INTERVAL '1 minute', timestamp) + '1 minute' AS timestamp,
+       (max(water_index) - min(water_index))                    AS water_consumption
+FROM water_consumption
+GROUP BY sensor_id, time_bucket(INTERVAL '1 minute', timestamp)
+ORDER BY water_consumption;
+
+-- Simplified test, where the view doesn't contain all group by clauses
+CREATE MATERIALIZED VIEW water_consumption_no_select_bucket
+            WITH (timescaledb.continuous, timescaledb.materialized_only = TRUE)
+AS
+SELECT sensor_id,
+       (max(water_index) - min(water_index))                    AS water_consumption
+FROM water_consumption
+GROUP BY sensor_id, time_bucket(INTERVAL '1 minute', timestamp)
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('water_consumption_no_select_bucket', NULL, NULL);
+
+-- The results of the view and the query over hypertable should be the same
+SELECT * FROM water_consumption_no_select_bucket ORDER BY water_consumption;
+SELECT sensor_id,
+       (max(water_index) - min(water_index))                    AS water_consumption
+FROM water_consumption
+GROUP BY sensor_id, time_bucket(INTERVAL '1 minute', timestamp)
+ORDER BY water_consumption;
+
+-- The test with SELECT matching GROUP BY and placing aggregate expression not the last
+CREATE MATERIALIZED VIEW water_consumption_aggregation_no_addition
+            WITH (timescaledb.continuous, timescaledb.materialized_only = TRUE)
+AS
+SELECT sensor_id,
+       (max(water_index) - min(water_index))                    AS water_consumption,
+       time_bucket(INTERVAL '1 minute', timestamp) AS timestamp
+FROM water_consumption
+GROUP BY sensor_id, time_bucket(INTERVAL '1 minute', timestamp)
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('water_consumption_aggregation_no_addition', NULL, NULL);
+
+-- The results of the view and the query over hypertable should be the same
+SELECT * FROM water_consumption_aggregation_no_addition ORDER BY water_consumption;
+SELECT sensor_id,
+       (max(water_index) - min(water_index))                    AS water_consumption,
+       time_bucket(INTERVAL '1 minute', timestamp) AS timestamp
+FROM water_consumption
+GROUP BY sensor_id, time_bucket(INTERVAL '1 minute', timestamp)
+ORDER BY water_consumption;
+
+DROP TABLE water_consumption CASCADE;

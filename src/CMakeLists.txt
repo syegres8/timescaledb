@@ -72,30 +72,13 @@ if (CMAKE_BUILD_TYPE MATCHES Debug)
 endif (CMAKE_BUILD_TYPE MATCHES Debug)
 
 include(build-defs.cmake)
-set(GITCOMMIT_H ${CMAKE_CURRENT_BINARY_DIR}/gitcommit.h)
 
-if (WIN32)
-  add_custom_command(
-    OUTPUT ${GITCOMMIT_H}
-    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    COMMAND ${CMAKE_COMMAND} -E echo_append "#define EXT_GIT_COMMIT " > ${GITCOMMIT_H}
-    COMMAND (${GIT_EXECUTABLE} describe --abbrev=4 --dirty --always --tags 2> NUL || call && echo "${PROJECT_VERSION_MOD}") >> ${GITCOMMIT_H}
-    COMMENT "Generating gitcommit.h"
-    VERBATIM)
-else ()
-  add_custom_command(
-    OUTPUT ${GITCOMMIT_H}
-    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    COMMAND ${CMAKE_COMMAND} -E echo_append "#define EXT_GIT_COMMIT " > ${GITCOMMIT_H}
-    COMMAND sh -c "if `${GIT_EXECUTABLE} status > /dev/null 2>&1`; then ${GIT_EXECUTABLE} describe --abbrev=4 --dirty --always --tags ; else echo ${PROJECT_VERSION_MOD} ; fi" >> ${GITCOMMIT_H}
-    COMMENT "Generating gitcommit.h"
-    VERBATIM)
-endif (WIN32)
+configure_file(gitcommit.h.in gitcommit.h)
 
 if (CMAKE_BUILD_TYPE MATCHES Debug)
-add_library(${PROJECT_NAME} MODULE ${SOURCES} ${GITCOMMIT_H} $<TARGET_OBJECTS:${TESTS_LIB_NAME}>)
+  add_library(${PROJECT_NAME} MODULE ${SOURCES} ${GITCOMMIT_H} $<TARGET_OBJECTS:${TESTS_LIB_NAME}>)
 else ()
-add_library(${PROJECT_NAME} MODULE ${SOURCES} ${GITCOMMIT_H})
+  add_library(${PROJECT_NAME} MODULE ${SOURCES} ${GITCOMMIT_H})
 endif ()
 
 if (SEND_TELEMETRY_DEFAULT)

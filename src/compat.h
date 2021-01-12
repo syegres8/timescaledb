@@ -19,17 +19,25 @@
 
 #include "export.h"
 
+#define TS_PREVENT_FUNC_IF_READ_ONLY()                                                             \
+	(PreventCommandIfReadOnly(psprintf("%s()", get_func_name(FC_FN_OID(fcinfo)))))
+
 #define is_supported_pg_version_11(version) ((version >= 110000) && (version < 120000))
 #define is_supported_pg_version_12(version) ((version >= 120000) && (version < 130000))
+#define is_supported_pg_version_13(version) ((version >= 130000) && (version < 140000))
 
 #define is_supported_pg_version(version)                                                           \
-	(is_supported_pg_version_11(version) || is_supported_pg_version_12(version))
+	(is_supported_pg_version_11(version) || is_supported_pg_version_12(version) ||                 \
+	 is_supported_pg_version_13(version))
 
 #define PG11 is_supported_pg_version_11(PG_VERSION_NUM)
 #define PG12 is_supported_pg_version_12(PG_VERSION_NUM)
+#define PG13 is_supported_pg_version_13(PG_VERSION_NUM)
 
 #define PG12_LT PG11
 #define PG12_GE !(PG12_LT)
+#define PG13_LT !(PG13)
+#define PG13_GE PG13
 
 #if !(is_supported_pg_version(PG_VERSION_NUM))
 #error "Unsupported PostgreSQL version"
@@ -194,6 +202,8 @@
 
 #endif
 
+#define FC_FN_OID(fcinfo) ((fcinfo)->flinfo->fn_oid)
+
 /* convenience setters */
 #define FC_SET_ARG(fcinfo, n, val)                                                                 \
 	do                                                                                             \
@@ -254,12 +264,6 @@
 #define TUPLE_DESC_HAS_OIDS(desc) false
 #endif
 
-#if defined(__GNUC__)
-#define TS_ATTRIBUTE_NONNULL(X) __attribute__((nonnull X))
-#else
-#define TS_ATTRIBUTE_NONNULL(X)
-#endif
-
 /* Compatibility functions for table access method API introduced in PG12 */
 #if PG11
 #include "compat/tupconvert.h"
@@ -301,6 +305,14 @@
 #define create_append_path_compat create_append_path
 #endif
 
+/*
+ * estimate_hashagg_tablesize is a static function in PG11 and earlier, so we map
+ * to our own copy when it's not available.
+ */
+#if PG11
+#define estimate_hashagg_tablesize(p, c, n) ts_estimate_hashagg_tablesize(p, c, n)
+#endif
+
 #include <commands/vacuum.h>
 #include <commands/defrem.h>
 
@@ -334,5 +346,47 @@ get_vacuum_options(const VacuumStmt *stmt)
 	return stmt->options;
 #endif
 }
+
+/* PG13 added a dstlen parameter to pg_b64_decode and pg_b64_encode */
+#if PG13_LT
+#define pg_b64_encode_compat(src, srclen, dst, dstlen) pg_b64_encode((src), (srclen), (dst))
+#define pg_b64_decode_compat(src, srclen, dst, dstlen) pg_b64_decode((src), (srclen), (dst))
+#else
+#define pg_b64_encode_compat(src, srclen, dst, dstlen)                                             \
+	pg_b64_encode((src), (srclen), (dst), (dstlen))
+#define pg_b64_decode_compat(src, srclen, dst, dstlen)                                             \
+	pg_b64_decode((src), (srclen), (dst), (dstlen))
+#endif
+
+/* PG13 changes the List implementation from a linked list to an array
+ * while most of the API functions did not change a few them have slightly
+ * different signature in PG13, additionally the list_make5 functions
+ * got removed. */
+#if PG13_LT
+#define lnext_compat(l, lc) lnext((lc))
+#define list_delete_cell_compat(l, lc, prev) list_delete_cell((l), (lc), (prev))
+#define for_each_cell_compat(cell, list, initcell) for_each_cell ((cell), (initcell))
+#else
+#define lnext_compat(l, lc) lnext((l), (lc))
+#define list_delete_cell_compat(l, lc, prev) list_delete_cell((l), (lc))
+#define list_make5(x1, x2, x3, x4, x5) lappend(list_make4(x1, x2, x3, x4), x5)
+#define list_make5_oid(x1, x2, x3, x4, x5) lappend_oid(list_make4_oid(x1, x2, x3, x4), x5)
+#define for_each_cell_compat(cell, list, initcell) for_each_cell ((cell), (list), (initcell))
+#endif
+
+/* PG13 removes the natts parameter from map_variable_attnos */
+#if PG13_LT
+#define map_variable_attnos_compat(node, varno, sublevels_up, map, natts, rowtype, found_wholerow) \
+	map_variable_attnos((node),                                                                    \
+						(varno),                                                                   \
+						(sublevels_up),                                                            \
+						(map),                                                                     \
+						(natts),                                                                   \
+						(rowtype),                                                                 \
+						(found_wholerow))
+#else
+#define map_variable_attnos_compat(node, varno, sublevels_up, map, natts, rowtype, found_wholerow) \
+	map_variable_attnos((node), (varno), (sublevels_up), (map), (rowtype), (found_wholerow))
+#endif
 
 #endif /* TIMESCALEDB_COMPAT_H */

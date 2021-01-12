@@ -10,13 +10,14 @@ set(TEST_FILES
   continuous_aggs_refresh.sql
   continuous_aggs_watermark.sql
   dist_views.sql
-  gapfill.sql
   partialize_finalize.sql
 )
 
 set(TEST_FILES_DEBUG
+  bgw_db_scheduler.sql
   bgw_reorder_drop_chunks.sql
   compress_bgw_reorder_drop_chunks.sql
+  chunk_utils_compression.sql
   compression_algos.sql
   compression_ddl.sql
   compression_errors.sql
@@ -29,10 +30,10 @@ set(TEST_FILES_DEBUG
   continuous_aggs_ddl.sql
   continuous_aggs_drop_chunks.sql
   continuous_aggs_dump.sql
-  continuous_aggs_materialize.sql
   continuous_aggs_multi.sql
   continuous_aggs.sql
   continuous_aggs_usage.sql
+  continuous_aggs_policy_run.sql
   data_fetcher.sql
   data_node_bootstrap.sql
   data_node.sql
@@ -47,7 +48,6 @@ set(TEST_FILES_DEBUG
   dist_partial_agg.sql
   dist_policy.sql
   dist_util.sql
-  issues.sql
   read_only.sql
   remote_connection_cache.sql
   remote_connection.sql
@@ -56,9 +56,11 @@ set(TEST_FILES_DEBUG
   remote_txn_id.sql
   remote_txn_resolve.sql
   remote_txn.sql
+  telemetry_community.sql
   telemetry_distributed.sql
   transparent_decompression_queries.sql
   tsl_tables.sql
+  license.sql
 )
 
 set(TEST_TEMPLATES
@@ -101,32 +103,33 @@ endif()
 if (${PG_VERSION_MAJOR} GREATER_EQUAL "12")
   list(APPEND TEST_FILES_DEBUG
     dist_hypertable_am.sql
+    continuous_aggs_tableam.sql
   )
 endif()
 
 # the following tests will run by itself before the parallel
 # tests because they fail or are flaky when run in parallel
-# dist_views.sql sets some global information, so do not run it 
+# dist_views.sql sets some global information, so do not run it
 # in parallel
 set(SOLO_TESTS
+  bgw_db_scheduler
   bgw_reorder_drop_chunks
   chunk_api
   compress_bgw_reorder_drop_chunks
+  compression_ddl
   continuous_aggs_bgw
+  continuous_aggs_ddl
   continuous_aggs_dump
   data_fetcher
   data_node
   debug_notice
   dist_api_calls
   dist_commands
-  dist_ddl
-  dist_hypertable-11
-  dist_hypertable-12
   dist_hypertable_am
   dist_hypertable_with_oids
   dist_partial_agg
-  issues
-  read_only
+  move-11
+  move-12
   remote_connection_cache
   remote_copy
   remote_txn

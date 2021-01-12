@@ -7,8 +7,10 @@
 #include <postgres.h>
 #include <utils/builtins.h>
 #include "dimension.h"
+#include "guc.h"
 #include "jsonb_utils.h"
 #include "policy_utils.h"
+#include "time_utils.h"
 
 /* Helper function to compare jsonb label value in the config
  * with passed in value.
@@ -64,7 +66,7 @@ policy_config_check_hypertable_lag_equality(Jsonb *config, const char *json_labe
 	}
 }
 
-Datum
+int64
 subtract_integer_from_now(int64 interval, Oid time_dim_type, Oid now_func)
 {
 	Datum now;
@@ -80,23 +82,26 @@ subtract_integer_from_now(int64 interval, Oid time_dim_type, Oid now_func)
 			res = DatumGetInt16(now) - interval;
 			if (res < PG_INT16_MIN || res > PG_INT16_MAX)
 				ereport(ERROR,
-						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW), errmsg("ts_interval overflow")));
-			return Int16GetDatum(res);
+						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
+						 errmsg("integer time overflow")));
+			return res;
 		case INT4OID:
 			res = DatumGetInt32(now) - interval;
 			if (res < PG_INT32_MIN || res > PG_INT32_MAX)
 				ereport(ERROR,
-						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW), errmsg("ts_interval overflow")));
-			return Int32GetDatum(res);
+						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
+						 errmsg("integer time overflow")));
+			return res;
 		case INT8OID:
 		{
 			bool overflow = pg_sub_s64_overflow(DatumGetInt64(now), interval, &res);
 			if (overflow)
 			{
 				ereport(ERROR,
-						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW), errmsg("ts_interval overflow")));
+						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
+						 errmsg("integer time overflow")));
 			}
-			return Int64GetDatum(res);
+			return res;
 		}
 		default:
 			pg_unreachable();
@@ -106,7 +111,11 @@ subtract_integer_from_now(int64 interval, Oid time_dim_type, Oid now_func)
 Datum
 subtract_interval_from_now(Interval *lag, Oid time_dim_type)
 {
+#ifdef TS_DEBUG
+	Datum res = ts_get_mock_time_or_current_time();
+#else
 	Datum res = TimestampTzGetDatum(GetCurrentTimestamp());
+#endif
 
 	switch (time_dim_type)
 	{

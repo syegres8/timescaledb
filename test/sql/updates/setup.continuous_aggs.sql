@@ -77,7 +77,7 @@ BEGIN
       HAVING min(location) >= 'NYC' and avg(temperature) > 2;
   ELSE
     CREATE MATERIALIZED VIEW IF NOT EXISTS mat_before
-    WITH ( timescaledb.continuous, timescaledb.refresh_lag='-30 day', timescaledb.max_interval_per_job ='1000 day')
+    WITH ( timescaledb.continuous)
     AS
       SELECT time_bucket('1week', timec) as bucket,
 	location,
@@ -118,10 +118,23 @@ BEGIN
 	histogram(temperature, 0, 100, 5)
       FROM conditions_before
       GROUP BY bucket, location
-      HAVING min(location) >= 'NYC' and avg(temperature) > 2;
-    PERFORM add_refresh_continuous_aggregate_policy('mat_before', NULL, '-30 days'::interval, '336 h');
+      HAVING min(location) >= 'NYC' and avg(temperature) > 2 WITH NO DATA;
+    PERFORM add_continuous_aggregate_policy('mat_before', NULL, '-30 days'::interval, '336 h');
 
+  END IF;
+
+  IF ts_version >= '2.0.0' THEN
+    ALTER MATERIALIZED VIEW mat_before SET (timescaledb.materialized_only=true);
+  ELSIF ts_version >= '1.7.0' THEN
+    ALTER VIEW mat_before SET (timescaledb.materialized_only=true);
   END IF;
 END $$;
 
+-- have to use psql conditional here because the procedure call can't be in transaction
+SELECT extversion < '2.0.0' AS has_refresh_mat_view from pg_extension WHERE extname = 'timescaledb' \gset
+\if :has_refresh_mat_view
 REFRESH MATERIALIZED VIEW mat_before;
+\else
+CALL refresh_continuous_aggregate('mat_before',NULL,NULL);
+\endif
+

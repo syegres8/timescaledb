@@ -21,9 +21,9 @@ import sys
 event_type = sys.argv[1]
 
 PG11_EARLIEST = "11.0"
-PG11_LATEST = "11.9"
+PG11_LATEST = "11.10"
 PG12_EARLIEST = "12.0"
-PG12_LATEST = "12.4"
+PG12_LATEST = "12.5"
 
 m = {"include": [],}
 
@@ -56,7 +56,7 @@ def build_release_config(overrides):
     "name": "Release",
     "build_type": "Release",
     "pg_build_args": "",
-    "tsdb_build_args": "",
+    "tsdb_build_args": "-DWARNINGS_AS_ERRORS=OFF",
     "coverage": False,
   })
   base_config.update(release_config)
@@ -68,7 +68,7 @@ def build_apache_config(overrides):
   apache_config = dict({
     "name": "ApacheOnly",
     "build_type": "Release",
-    "tsdb_build_args": "-DAPACHE_ONLY=1",
+    "tsdb_build_args": "-DAPACHE_ONLY=1 -DWARNINGS_AS_ERRORS=OFF",
     "pg_build_args": "",
     "coverage": False,
   })
@@ -111,7 +111,7 @@ if event_type != "pull_request":
     "llvm_config": "/usr/bin/llvm-config-8",
     "clang": "clang-8",
     "extra_packages": "llvm-8 llvm-8-dev llvm-8-tools",
-    "installcheck_args": "IGNORES='continuous_aggs_insert continuous_aggs_multi'"
+    "installcheck_args": "IGNORES='continuous_aggs_insert continuous_aggs_multi continuous_aggs_concurrent_refresh'"
   }
   m["include"].append(build_debug_config(pg11_debug_earliest))
 

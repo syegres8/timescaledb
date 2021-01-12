@@ -35,7 +35,9 @@ static const struct config_enum_entry telemetry_level_options[] = {
 };
 
 static const struct config_enum_entry remote_data_fetchers[] = {
-	{ "rowbyrow", RowByRowFetcherType, false }, { "cursor", CursorFetcherType, false }
+	{ "rowbyrow", RowByRowFetcherType, false },
+	{ "cursor", CursorFetcherType, false },
+	{ NULL, 0, false }
 };
 
 bool ts_guc_enable_optimizations = true;
@@ -54,7 +56,7 @@ int ts_guc_max_open_chunks_per_insert = 10;
 int ts_guc_max_cached_chunks_per_hypertable = 10;
 int ts_guc_telemetry_level = TELEMETRY_DEFAULT;
 
-TSDLLEXPORT char *ts_guc_license_key = TS_DEFAULT_LICENSE;
+TSDLLEXPORT char *ts_guc_license = TS_LICENSE_DEFAULT;
 char *ts_last_tune_time = NULL;
 char *ts_last_tune_version = NULL;
 char *ts_telemetry_cloud = NULL;
@@ -284,7 +286,7 @@ _guc_init(void)
 							 "Pick data fetcher type based on type of queries you plan to run "
 							 "(rowbyrow or cursor)",
 							 (int *) &ts_guc_remote_data_fetcher,
-							 RowByRowFetcherType,
+							 CursorFetcherType,
 							 remote_data_fetchers,
 							 PGC_USERSET,
 							 0,
@@ -360,15 +362,15 @@ _guc_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomStringVariable(/* name= */ "timescaledb.license_key",
-							   /* short_dec= */ "TimescaleDB license key",
+	DefineCustomStringVariable(/* name= */ "timescaledb.license",
+							   /* short_dec= */ "TimescaleDB license type",
 							   /* long_dec= */ "Determines which features are enabled",
-							   /* valueAddr= */ &ts_guc_license_key,
-							   /* bootValue= */ TS_DEFAULT_LICENSE,
+							   /* valueAddr= */ &ts_guc_license,
+							   /* bootValue= */ TS_LICENSE_DEFAULT,
 							   /* context= */ PGC_SUSET,
-							   /* flags= */ GUC_SUPERUSER_ONLY,
-							   /* check_hook= */ ts_license_update_check,
-							   /* assign_hook= */ ts_license_on_assign,
+							   /* flags= */ 0,
+							   /* check_hook= */ ts_license_guc_check_hook,
+							   /* assign_hook= */ ts_license_guc_assign_hook,
 							   /* show_hook= */ NULL);
 
 	DefineCustomStringVariable(/* name= */ "timescaledb.last_tuned",

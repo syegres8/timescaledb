@@ -13,35 +13,29 @@
 \o
 \set ECHO all
 
--- Cleanup from other potential tests that created these databases
-SET client_min_messages TO ERROR;
-DROP DATABASE IF EXISTS data_node_1;
-DROP DATABASE IF EXISTS data_node_2;
-DROP DATABASE IF EXISTS data_node_3;
-SET client_min_messages TO NOTICE;
+\set MY_DB1 :TEST_DBNAME _1
+\set MY_DB2 :TEST_DBNAME _2
+\set MY_DB3 :TEST_DBNAME _3
 
-SELECT * FROM add_data_node('data_node_1', host => 'localhost',
-                            database => 'data_node_1');
-SELECT * FROM add_data_node('data_node_2', host => 'localhost',
-                            database => 'data_node_2');
-SELECT * FROM add_data_node('data_node_3', host => 'localhost',
-                            database => 'data_node_3');
+SELECT * FROM add_data_node('data_node_1', host => 'localhost', database => :'MY_DB1');
+SELECT * FROM add_data_node('data_node_2', host => 'localhost', database => :'MY_DB2');
+SELECT * FROM add_data_node('data_node_3', host => 'localhost', database => :'MY_DB3');
 GRANT USAGE ON FOREIGN SERVER data_node_1, data_node_2, data_node_3 TO PUBLIC;
 
 -- Presence of non-distributed hypertables on data nodes should not cause issues
-SELECT distributed_exec('CREATE TABLE local(time timestamptz, measure int)', '{ "data_node_1", "data_node_3" }');
-SELECT distributed_exec($$ SELECT create_hypertable('local', 'time') $$, '{ "data_node_1", "data_node_3" }');
+CALL distributed_exec('CREATE TABLE local(time timestamptz, measure int)', '{ "data_node_1", "data_node_3" }');
+CALL distributed_exec($$ SELECT create_hypertable('local', 'time') $$, '{ "data_node_1", "data_node_3" }');
 
 -- Import testsupport.sql file to data nodes
 \unset ECHO
 \o /dev/null
-\c data_node_1
+\c :MY_DB1
 SET client_min_messages TO ERROR;
 \ir :TEST_SUPPORT_FILE
-\c data_node_2
+\c :MY_DB2
 SET client_min_messages TO ERROR;
 \ir :TEST_SUPPORT_FILE
-\c data_node_3
+\c :MY_DB3
 SET client_min_messages TO ERROR;
 \ir :TEST_SUPPORT_FILE
 \c :TEST_DBNAME :ROLE_SUPERUSER;
@@ -183,11 +177,11 @@ $$);
 SELECT * FROM test.remote_exec(NULL, $$ SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'disttable' $$);
 
 -- CREATE and DROP SCHEMA CASCADE
-\c data_node_1
+\c :MY_DB1
 CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
-\c data_node_2
+\c :MY_DB2
 CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
-\c data_node_3
+\c :MY_DB3
 CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
 \c :TEST_DBNAME :ROLE_SUPERUSER;
 SET ROLE :ROLE_1;
@@ -455,7 +449,7 @@ SELECT * FROM set_replication_factor('disttable',  NULL);
 \set ON_ERROR_STOP 1
 SELECT replication_factor FROM _timescaledb_catalog.hypertable ORDER BY id;
 
-\c data_node_1
+\c :MY_DB1
 SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'disttable';
 SELECT * FROM test.show_indexes('disttable');
 
@@ -516,7 +510,7 @@ INSERT INTO disttable VALUES
 CREATE MATERIALIZED VIEW disttable_cagg WITH (timescaledb.continuous)
 AS SELECT time_bucket('2 days', time), device, max(value)
     FROM disttable
-    GROUP BY 1, 2;
+    GROUP BY 1, 2 WITH NO DATA;
 \set ON_ERROR_STOP 1
 
 DROP TABLE disttable;
@@ -524,6 +518,6 @@ DROP TABLE disttable;
 -- cleanup
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
 DROP SCHEMA disttable_schema CASCADE;
-DROP DATABASE data_node_1;
-DROP DATABASE data_node_2;
-DROP DATABASE data_node_3;
+DROP DATABASE :MY_DB1;
+DROP DATABASE :MY_DB2;
+DROP DATABASE :MY_DB3;

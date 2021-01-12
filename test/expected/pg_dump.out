@@ -72,9 +72,9 @@ WARNING:  target chunk size for adaptive chunking is less than 10 MB
 
 -- Chunk sizing func set
 SELECT * FROM _timescaledb_catalog.hypertable;
- id | schema_name |   table_name   | associated_schema_name | associated_table_prefix | num_dimensions | chunk_sizing_func_schema |     chunk_sizing_func_name      | chunk_target_size | compressed | compressed_hypertable_id | replication_factor 
-----+-------------+----------------+------------------------+-------------------------+----------------+--------------------------+---------------------------------+-------------------+------------+--------------------------+--------------------
-  1 | test_schema | two_Partitions | _timescaledb_internal  | _hyper_1                |              2 | public                   | custom_calculate_chunk_interval |           1048576 | f          |                          |                   
+ id | schema_name |   table_name   | associated_schema_name | associated_table_prefix | num_dimensions | chunk_sizing_func_schema |     chunk_sizing_func_name      | chunk_target_size | compression_state | compressed_hypertable_id | replication_factor 
+----+-------------+----------------+------------------------+-------------------------+----------------+--------------------------+---------------------------------+-------------------+-------------------+--------------------------+--------------------
+  1 | test_schema | two_Partitions | _timescaledb_internal  | _hyper_1                |              2 | public                   | custom_calculate_chunk_interval |           1048576 |                 0 |                          |                   
 (1 row)
 
 SELECT proname, pronamespace, pronargs
@@ -503,9 +503,9 @@ SELECT * FROM _timescaledb_catalog.chunk_constraint;
 
 --Chunk sizing function should have been restored
 SELECT * FROM _timescaledb_catalog.hypertable;
- id | schema_name |   table_name   | associated_schema_name | associated_table_prefix | num_dimensions | chunk_sizing_func_schema |     chunk_sizing_func_name      | chunk_target_size | compressed | compressed_hypertable_id | replication_factor 
-----+-------------+----------------+------------------------+-------------------------+----------------+--------------------------+---------------------------------+-------------------+------------+--------------------------+--------------------
-  1 | test_schema | two_Partitions | _timescaledb_internal  | _hyper_1                |              2 | public                   | custom_calculate_chunk_interval |           1048576 | f          |                          |                   
+ id | schema_name |   table_name   | associated_schema_name | associated_table_prefix | num_dimensions | chunk_sizing_func_schema |     chunk_sizing_func_name      | chunk_target_size | compression_state | compressed_hypertable_id | replication_factor 
+----+-------------+----------------+------------------------+-------------------------+----------------+--------------------------+---------------------------------+-------------------+-------------------+--------------------------+--------------------
+  1 | test_schema | two_Partitions | _timescaledb_internal  | _hyper_1                |              2 | public                   | custom_calculate_chunk_interval |           1048576 |                 0 |                          |                   
 (1 row)
 
 SELECT proname, pronamespace, pronargs
@@ -533,16 +533,15 @@ WHERE   refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND
         classid='pg_catalog.pg_class'::pg_catalog.regclass
         AND objid NOT IN (select unnest(extconfig) from pg_extension where extname='timescaledb')
         ORDER BY objid::text DESC;
-                       objid                        
-----------------------------------------------------
+                       objid                       
+---------------------------------------------------
  timescaledb_information.compression_settings
  timescaledb_information.dimensions
  timescaledb_information.chunks
- timescaledb_information.data_node
- timescaledb_information.continuous_aggregate_stats
+ timescaledb_information.data_nodes
  timescaledb_information.continuous_aggregates
- timescaledb_information.policy_stats
- timescaledb_information.license
+ timescaledb_information.jobs
+ timescaledb_information.job_stats
  timescaledb_information.hypertables
  _timescaledb_internal.compressed_chunk_stats
  _timescaledb_internal.hypertable_chunk_local_size
@@ -550,7 +549,7 @@ WHERE   refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND
  _timescaledb_internal.bgw_policy_chunk_stats
  _timescaledb_internal.bgw_job_stat
  _timescaledb_catalog.tablespace_id_seq
-(15 rows)
+(14 rows)
 
 -- Make sure we can't run our restoring functions as a normal perm user as that would disable functionality for the whole db
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER

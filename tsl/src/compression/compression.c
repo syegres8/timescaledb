@@ -37,9 +37,11 @@
 #include "compat.h"
 
 #include "array.h"
+#include "chunk.h"
 #include "deltadelta.h"
 #include "dictionary.h"
 #include "gorilla.h"
+#include "compression_chunk_size.h"
 #include "create.h"
 #include "custom_type_cache.h"
 #include "segment_meta.h"
@@ -157,6 +159,49 @@ static void row_compressor_finish(RowCompressor *row_compressor);
  ** compress_chunk **
  ********************/
 
+static void
+capture_pgclass_stats(Oid table_oid, int *out_pages, int *out_visible, float *out_tuples)
+{
+	Relation pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	HeapTuple tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(table_oid));
+	Form_pg_class classform;
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "could not find tuple for relation %u", table_oid);
+
+	classform = (Form_pg_class) GETSTRUCT(tuple);
+
+	*out_pages = classform->relpages;
+	*out_visible = classform->relallvisible;
+	*out_tuples = classform->reltuples;
+
+	heap_freetuple(tuple);
+	table_close(pg_class, RowExclusiveLock);
+}
+
+static void
+restore_pgclass_stats(Oid table_oid, int pages, int visible, float tuples)
+{
+	Relation pg_class;
+	HeapTuple tuple;
+	Form_pg_class classform;
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(table_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "could not find tuple for relation %u", table_oid);
+	classform = (Form_pg_class) GETSTRUCT(tuple);
+
+	classform->relpages = pages;
+	classform->relallvisible = visible;
+	classform->reltuples = tuples;
+
+	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+	heap_freetuple(tuple);
+	table_close(pg_class, RowExclusiveLock);
+}
+
 /* Truncate the relation WITHOUT applying triggers. This is the
  * main difference with ExecuteTruncate. Triggers aren't applied
  * because the data remains, just in compressed form. Also don't
@@ -173,6 +218,8 @@ truncate_relation(Oid table_oid)
 	MultiXactId minmulti;
 #endif
 	Oid toast_relid;
+	int pages, visible;
+	float tuples;
 
 	/* Chunks should never have fks into them, but double check */
 	if (fks != NIL)
@@ -183,6 +230,7 @@ truncate_relation(Oid table_oid)
 	minmulti = GetOldestMultiXactId();
 #endif
 
+	capture_pgclass_stats(table_oid, &pages, &visible, &tuples);
 	RelationSetNewRelfilenode(rel,
 							  rel->rd_rel->relpersistence
 #if PG12_LT
@@ -212,6 +260,10 @@ truncate_relation(Oid table_oid)
 	}
 
 	reindex_relation(table_oid, REINDEX_REL_PROCESS_TOAST, 0);
+	rel = table_open(table_oid, AccessExclusiveLock);
+	restore_pgclass_stats(table_oid, pages, visible, tuples);
+	CommandCounterIncrement();
+	table_close(rel, NoLock);
 }
 
 CompressionStats
@@ -990,7 +1042,6 @@ decompress_chunk(Oid in_table, Oid out_table)
 
 	Oid compressed_data_type_oid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
 
-	Assert(in_desc->natts >= out_desc->natts);
 	Assert(OidIsValid(compressed_data_type_oid));
 
 	{
@@ -1011,6 +1062,14 @@ decompress_chunk(Oid in_table, Oid out_table)
 			.decompressed_datums = palloc(sizeof(Datum) * out_desc->natts),
 			.decompressed_is_nulls = palloc(sizeof(bool) * out_desc->natts),
 		};
+		/*
+		 * We need to make sure decompressed_is_nulls is in a defined state. While this
+		 * will get written for normal columns it will not get written for dropped columns
+		 * since dropped columns don't exist in the compressed chunk so we initiallize
+		 * with true here.
+		 */
+		memset(decompressor.decompressed_is_nulls, true, out_desc->natts);
+
 		Datum *compressed_datums = palloc(sizeof(*compressed_datums) * in_desc->natts);
 		bool *compressed_is_nulls = palloc(sizeof(*compressed_is_nulls) * in_desc->natts);
 
@@ -1365,7 +1424,11 @@ tsl_compressed_data_in(PG_FUNCTION_ARGS)
 
 	decoded_len = pg_b64_dec_len(input_len);
 	decoded = palloc(decoded_len + 1);
-	decoded_len = pg_b64_decode(input, input_len, decoded);
+	decoded_len = pg_b64_decode_compat(input, input_len, decoded, decoded_len);
+
+	if (decoded_len < 0)
+		elog(ERROR, "could not decode base64-encoded compressed data");
+
 	decoded[decoded_len] = '\0';
 	data = (StringInfoData){
 		.data = decoded,
@@ -1387,7 +1450,11 @@ tsl_compressed_data_out(PG_FUNCTION_ARGS)
 	const char *raw_data = VARDATA(bytes);
 	int encoded_len = pg_b64_enc_len(raw_len);
 	char *encoded = palloc(encoded_len + 1);
-	encoded_len = pg_b64_encode(raw_data, raw_len, encoded);
+	encoded_len = pg_b64_encode_compat(raw_data, raw_len, encoded, encoded_len);
+
+	if (encoded_len < 0)
+		elog(ERROR, "could not base64-encode compressed data");
+
 	encoded[encoded_len] = '\0';
 
 	PG_RETURN_CSTRING(encoded);
@@ -1399,4 +1466,47 @@ compression_get_toast_storage(CompressionAlgorithms algorithm)
 	if (algorithm == _INVALID_COMPRESSION_ALGORITHM || algorithm >= _END_COMPRESSION_ALGORITHMS)
 		elog(ERROR, "invalid compression algorithm %d", algorithm);
 	return definitions[algorithm].compressed_data_storage;
+}
+
+/* Get relstats from compressed chunk and insert into relstats for the
+ * corresponding chunk (that held the uncompressed data) from raw hypertable
+ */
+extern void
+update_compressed_chunk_relstats(Oid uncompressed_relid, Oid compressed_relid)
+{
+	double rowcnt;
+	int comp_pages, uncomp_pages, comp_visible, uncomp_visible;
+	float comp_tuples, uncomp_tuples, out_tuples;
+	Chunk *uncompressed_chunk = ts_chunk_get_by_relid(uncompressed_relid, true);
+	Chunk *compressed_chunk = ts_chunk_get_by_relid(compressed_relid, true);
+
+	if (uncompressed_chunk->table_id != uncompressed_relid ||
+		uncompressed_chunk->fd.compressed_chunk_id != compressed_chunk->fd.id ||
+		compressed_chunk->table_id != compressed_relid)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("mismatched chunks for relstats update %d %d",
+						uncompressed_relid,
+						compressed_relid)));
+	}
+
+	capture_pgclass_stats(uncompressed_relid, &uncomp_pages, &uncomp_visible, &uncomp_tuples);
+
+	/* Before compressing a chunk in 2.0, we save its stats. Prior
+	 * releases do not support this. So the stats on uncompressed relid
+	 * could be invalid. In this case, do the best that we can.
+	 */
+	if (uncomp_tuples == 0)
+	{
+		/* we need page info from compressed relid */
+		capture_pgclass_stats(compressed_relid, &comp_pages, &comp_visible, &comp_tuples);
+		rowcnt = (double) ts_compression_chunk_size_row_count(uncompressed_chunk->fd.id);
+		if (rowcnt > 0)
+			out_tuples = (float4) rowcnt;
+		else
+			out_tuples = (float4) comp_tuples;
+		restore_pgclass_stats(uncompressed_relid, comp_pages, comp_visible, out_tuples);
+		CommandCounterIncrement();
+	}
 }

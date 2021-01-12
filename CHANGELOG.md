@@ -4,6 +4,292 @@
 `psql` with the `-X` flag to prevent any `.psqlrc` commands from
 accidentally triggering the load of a previous DB version.**
 
+## 2.0.0 (2020-12-18)
+
+With this release, we are officially moving TimescaleDB 2.0 to GA, 
+concluding several release candidates.
+
+TimescaleDB 2.0 adds the much-anticipated support for distributed 
+hypertables (multi-node TimescaleDB), as well as new features and 
+enhancements to core functionality to give users better clarity and 
+more control and flexibility over their data.
+
+Multi-node architecture:  In particular, with TimescaleDB 2.0, users 
+can now create distributed hypertables across multiple instances of 
+TimescaleDB, configured so that one instance serves as an access node 
+and multiple others as data nodes. All queries for a distributed 
+hypertable are issued to the access node, but inserted data and queries
+are pushed down across data nodes for greater scale and performance.
+
+Multi-node TimescaleDB can be self managed or, for easier operation, 
+launched within Timescale's fully-managed cloud services.
+
+This release also adds:
+
+* Support for user-defined actions, allowing users to define, 
+  customize, and schedule automated tasks, which can be run by the 
+  built-in jobs scheduling framework now exposed to users.
+* Significant changes to continuous aggregates, which now separate the 
+  view creation from the policy.  Users can now refresh individual 
+  regions of the continuous aggregate materialized view, or schedule 
+  automated refreshing via  policy.
+* Redesigned informational views, including new (and more general) 
+  views for information about hypertable's dimensions and chunks, 
+  policies and user-defined actions, as well as support for multi-node 
+  TimescaleDB.
+* Moving all formerly enterprise features into our Community Edition, 
+  and updating Timescale License, which now provides additional (more 
+  permissive) rights to users and developers.
+
+Some of the changes above (e.g., continuous aggregates, updated 
+informational views) do introduce breaking changes to APIs and are not 
+backwards compatible. While the update scripts in TimescaleDB 2.0 will 
+upgrade databases running TimescaleDB 1.x automatically, some of these 
+API and feature changes may require changes to clients and/or upstream 
+scripts that rely on the previous APIs.  Before upgrading, we recommend
+reviewing upgrade documentation at docs.timescale.com for more details.
+
+**Major Features**
+
+TimescaleDB 2.0 moves the following major features to GA:
+* #1923 Add support for distributed hypertables
+* #2006 Add support for user-defined actions
+* #2125 #2221 Improve Continuous Aggregate API
+* #2084 #2089 #2098 #2417 Redesign informational views
+* #2435 Move enterprise features to community
+* #2437 Update Timescale License
+
+**Previous Release Candidates**
+
+* #2702 Release Candidate 4 (December 2, 2020)
+* #2637 Release Candidate 3 (November 12, 2020)
+* #2554 Release Candidate 2 (October 20, 2020)
+* #2478 Release Candidate 1 (October 1, 2020)
+
+**Minor Features**
+
+Since the last release candidate 4, there are several minor 
+improvements:
+* #2746 Optimize locking for create chunk API
+* #2705 Block tableoid access on distributed hypertable
+* #2730 Do not allow unique index on compressed hypertables
+* #2764 Bootstrap data nodes with versioned extension
+
+**Bugfixes**
+
+Since the last release candidate 4, there are several bugfixes:
+* #2719 Support disabling compression on distributed hypertables 
+* #2742 Fix compression status in chunks view for distributed chunks
+* #2751 Fix crash and cancel when adding data node
+* #2763 Fix check constraint on hypertable metadata table
+
+**Thanks**
+
+Thanks to all contributors for the TimescaleDB 2.0 release:
+* @airton-neto for reporting a bug in executing some queries with UNION
+* @nshah14285 for reporting an issue with propagating privileges
+* @kalman5 for reporting an issue with renaming constraints
+* @LbaNeXte for reporting a bug in decompression for queries with 
+  subqueries
+* @semtexzv for reporting an issue with continuous aggregates on 
+  int-based hypertables
+* @mr-ns for reporting an issue with privileges for creating chunks
+* @cloud-rocket for reporting an issue with setting an owner on 
+  continuous aggregate
+* @jocrau for reporting a bug during creating an index with transaction
+  per chunk
+* @fvannee for reporting an issue with custom time types
+* @ArtificialPB for reporting a bug in executing queries with 
+  conditional ordering on compressed hypertable
+* @dutchgecko for reporting an issue with continuous aggregate datatype
+  handling
+* @lambdaq for suggesting to improve error message in continuous 
+  aggregate creation
+* @francesco11112 for reporting memory issue on COPY
+* @Netskeh for reporting bug on time_bucket problem in continuous 
+  aggregates
+* @mr-ns for reporting the issue with CTEs on distributed hypertables
+* @akamensky for reporting an issue with recursive cache invalidation
+* @ryanbooz for reporting slow queries with real-time aggregation on 
+  continuous aggregates
+* @cevian for reporting an issue with disabling compression on 
+  distributed hypertables
+
+## 2.0.0-rc4 (2020-12-02)
+
+This release candidate contains bugfixes since the previous release
+candidate, as well as additional minor features. It improves
+validation of configuration changes for background jobs, adds support
+for gapfill on distributed tables, contains improvements to the memory 
+handling for large COPY, and contains improvements to compression for
+distributed hypertables.
+
+**Minor Features**
+* #2689 Check configuration in alter_job and add_job
+* #2696 Support gapfill on distributed hypertable
+* #2468 Show more information in get_git_commit
+* #2678 Include user actions into job stats view
+* #2664 Fix support for complex aggregate expression
+* #2672 Add hypertable to continuous aggregates view
+* #2662 Save compression metadata settings on access node
+* #2707 Introduce additional db for data node bootstrapping
+
+**Bugfixes**
+* #2688 Fix crash for concurrent drop and compress chunk
+* #2666 Fix timeout handling in async library
+* #2683 Fix crash in add_job when given NULL interval
+* #2698 Improve memory handling for remote COPY
+* #2555 Set metadata for chunks compressed before 2.0
+
+**Thanks**
+* @francesco11112 for reporting memory issue on COPY
+* @Netskeh for reporting bug on time_bucket problem in continuous
+  aggregates
+
+## 2.0.0-rc3 (2020-11-12)
+
+This release candidate contains bugfixes since the previous release
+candidate, as well as additional minor features including support for
+"user-mapping" authentication between access/data nodes and an
+experimental API for refreshing continuous aggregates on individual
+chunks.
+
+**Minor Features**
+* #2627 Add optional user mappings support
+* #2635 Add API to refresh continuous aggregate on chunk
+
+**Bugfixes**
+* #2560 Fix SCHEMA DROP CASCADE with continuous aggregates
+* #2593 Set explicitly all lock parameters in alter_job
+* #2604 Fix chunk creation on hypertables with foreign key constraints 
+* #2610 Support analyze of internal compression table
+* #2612 Optimize internal cagg_watermark function
+* #2613 Refresh correct partial during refresh on drop
+* #2617 Fix validation of available extensions on data node
+* #2619 Fix segfault in decompress_chunk for chunks with dropped columns 
+* #2620 Fix DROP CASCADE for continuous aggregate 
+* #2625 Fix subquery errors when using AsyncAppend
+* #2626 Fix incorrect total_table_pages setting for compressed scan
+* #2628 Stop recursion in cache invalidation 
+
+**Thanks**
+* @mr-ns for reporting the issue with CTEs on distributed hypertables
+* @akamensky for reporting an issue with recursive cache invalidation
+* @ryanbooz for reporting slow queries with real-time aggregation on
+  continuous aggregates
+
+## 2.0.0-rc2 (2020-10-21)
+
+This release candidate contains bugfixes since the previous release candidate.
+
+**Minor Features**
+* #2520 Support non-transactional distibuted_exec
+
+**Bugfixes**
+* #2307 Overflow handling for refresh policy with integer time
+* #2503 Remove error for correct bootstrap of data node
+* #2507 Fix validation logic when adding a new data node
+* #2510 Fix outer join qual propagation
+* #2514 Lock dimension slices when creating new chunk
+* #2515 Add if_attached argument to detach_data_node()
+* #2517 Fix member access within misaligned address in chunk_update_colstats
+* #2525 Fix index creation on hypertables with dropped columns
+* #2543 Pass correct status to lock_job
+* #2544 Assume custom time type range is same as bigint
+* #2563 Fix DecompressChunk path generation
+* #2564 Improve continuous aggregate datatype handling
+* #2568 Change use of ssl_dir GUC
+* #2571 Make errors and messages conform to style guide
+* #2577 Exclude compressed chunks from ANALYZE/VACUUM
+
+## 2.0.0-rc1 (2020-10-06)
+
+This release adds major new features and bugfixes since the 1.7.4 release.
+We deem it moderate priority for upgrading.
+
+This release adds the long-awaited support for distributed hypertables to
+TimescaleDB. With 2.0, users can create distributed hypertables across
+multiple instances of TimescaleDB, configured so that one instance serves
+as an access node and multiple others as data nodes. All queries for a
+distributed hypertable are issued to the access node, but inserted data
+and queries are pushed down across data nodes for greater scale and
+performance.
+
+This release also adds support for user-defined actions allowing users to
+define actions that are run by the TimescaleDB automation framework.
+
+In addition to these major new features, the 2.0 branch introduces _breaking_ changes
+to APIs and existing features, such as continuous aggregates. These changes are not
+backwards compatible and might require changes to clients and/or scripts that rely on
+the previous APIs. Please review our updated documentation and do proper testing to
+ensure compatibility with your existing applications.
+
+The noticeable breaking changes in APIs are:
+- Redefined functions for policies
+- A continuous aggregate is now created with `CREATE MATERIALIZED VIEW`
+  instead of `CREATE VIEW` and automated refreshing requires adding a policy
+  via `add_continuous_aggregate_policy`
+- Redesign of informational views, including new (and more general) views for
+  information about policies and user-defined actions
+
+This release candidate is upgradable, so if you are on a previous release (e.g., 1.7.4)
+you can upgrade to the release candidate and later expect to be able to upgrade to the
+final 2.0 release. However, please carefully consider your compatibility requirements
+_before_ upgrading.
+
+**Major Features**
+* #1923 Add support for distributed hypertables
+* #2006 Add support for user-defined actions
+* #2435 Move enterprise features to community
+* #2437 Update Timescale License
+
+**Minor Features**
+* #2011 Constify TIMESTAMPTZ OP INTERVAL in constraints
+* #2105 Support moving compressed chunks
+
+**Bugfixes**
+* #1843 Improve handling of "dropped" chunks
+* #1886 Change ChunkAppend leader to use worker subplan
+* #2116 Propagate privileges from hypertables to chunks
+* #2263 Fix timestamp overflow in time_bucket optimization
+* #2270 Fix handling of non-reference counted TupleDescs in gapfill
+* #2325 Fix rename constraint/rename index
+* #2370 Fix detection of hypertables in subqueries
+* #2376 Fix caggs width expression handling on int based hypertables
+* #2416 Check insert privileges to create chunk
+* #2428 Allow owner change of continuous aggregate
+* #2436 Propagate grants in continuous aggregates
+
+## 2.0.0-beta6 (2020-09-14)
+
+**For beta releases**, upgrading from an earlier version of the
+extension (including previous beta releases) is not supported.
+
+This beta release includes breaking changes to APIs. The most 
+notable changes since the beta-5 release are the following, which will 
+be reflected in forthcoming documentation for the 2.0 release.
+
+* Existing information views were reorganized. Retrieving information 
+about sizes and statistics was moved to functions. New views were added 
+to expose information, which was previously available only internally.
+* New ability to create custom jobs was added.
+* Continuous aggregate API was redesigned. Its policy creation is separated 
+from the view creation.
+* compress_chunk_policy and drop_chunk_policy were renamed to compression_policy and 
+retention_policy.
+
+## 1.7.4 (2020-09-07)
+
+This maintenance release contains bugfixes since the 1.7.3 release. We deem it
+high priority for upgrading if TimescaleDB is deployed with replicas (synchronous
+or asynchronous).
+
+In particular the fixes contained in this maintenance release address an issue with
+running queries on compressed hypertables on standby nodes.
+
+**Bugfixes**
+* #2340 Remove tuple lock on select path
+
 ## 1.7.3 (2020-07-27)
 
 This maintenance release contains bugfixes since the 1.7.2 release. We deem it high

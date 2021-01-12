@@ -86,6 +86,7 @@
 #include "extension_constants.h"
 #include "plan_expand_hypertable.h"
 #include "partialize_finalize.h"
+#include "nodes/gapfill/planner.h"
 
 /*
  * Global context for foreign_expr_walker's search of an expression tree.
@@ -211,34 +212,6 @@ static Node *deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
 static bool is_subquery_var(Var *node, RelOptInfo *foreignrel, int *relno, int *colno);
 static void get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel, int *relno,
 										  int *colno);
-
-/*
- * Find an equivalence class member expression, all of whose Vars, come from
- * the indicated relation.
- */
-extern Expr *
-find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
-{
-	ListCell *lc_em;
-
-	foreach (lc_em, ec->ec_members)
-	{
-		EquivalenceMember *em = lfirst(lc_em);
-
-		if (bms_is_subset(em->em_relids, rel->relids))
-		{
-			/*
-			 * If there is more than one equivalence member whose Vars are
-			 * taken entirely from this relation, we'll be content to choose
-			 * any one of those.
-			 */
-			return em->em_expr;
-		}
-	}
-
-	/* We didn't find any suitable equivalence class expression */
-	return NULL;
-}
 
 /*
  * Examine each qual clause in input_conds, and classify them into two groups,
@@ -402,6 +375,12 @@ is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 		glob_cxt.relids = baserel->relids;
 
 	if (!foreign_expr_walker((Node *) expr, &glob_cxt))
+		return false;
+
+	/*
+	 * It is not supported to execute time_bucket_gapfill on data node.
+	 */
+	if (gapfill_in_expression(expr))
 		return false;
 
 	/*
@@ -2232,7 +2211,7 @@ deparseSubscriptingRef(SubscriptingRef *node, deparse_expr_cxt *context)
 		{
 			deparseExpr(lfirst(lowlist_item), context);
 			appendStringInfoChar(buf, ':');
-			lowlist_item = lnext(lowlist_item);
+			lowlist_item = lnext_compat(node->reflowerindexpr, lowlist_item);
 		}
 		deparseExpr(lfirst(uplist_item), context);
 		appendStringInfoChar(buf, ']');
@@ -2294,7 +2273,7 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 	{
 		if (!first)
 			appendStringInfoString(buf, ", ");
-		if (use_variadic && lnext(arg) == NULL)
+		if (use_variadic && lnext_compat(node->args, arg) == NULL)
 			appendStringInfoString(buf, "VARIADIC ");
 		deparseExpr((Expr *) lfirst(arg), context);
 		first = false;
@@ -2622,7 +2601,7 @@ deparseAggref(Aggref *node, deparse_expr_cxt *context)
 				first = false;
 
 				/* Add VARIADIC */
-				if (use_variadic && lnext(arg) == NULL)
+				if (use_variadic && lnext_compat(node->args, arg) == NULL)
 					appendStringInfoString(buf, "VARIADIC ");
 
 				deparseExpr((Expr *) n, context);
@@ -2799,7 +2778,7 @@ appendOrderByClause(List *pathkeys, deparse_expr_cxt *context)
 		PathKey *pathkey = lfirst(lcell);
 		Expr *em_expr;
 
-		em_expr = find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+		em_expr = ts_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
 		Assert(em_expr != NULL);
 
 		appendStringInfoString(buf, delim);

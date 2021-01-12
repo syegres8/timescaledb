@@ -1,8 +1,10 @@
 set(TEST_FILES_SHARED
   constraint_exclusion_prepared.sql
   decompress_placeholdervar.sql
+  dist_gapfill.sql
+  dist_insert.sql
+  gapfill.sql
   ordered_append_join.sql
-  license.sql
 )
 
 set(TEST_TEMPLATES_SHARED
@@ -23,6 +25,10 @@ foreach(TEMPLATE_FILE ${TEST_TEMPLATES_SHARED})
   configure_file(${TEMPLATE_FILE} ${CMAKE_CURRENT_SOURCE_DIR}/${TEST_FILE} COPYONLY)
   list(APPEND TEST_FILES_SHARED ${TEST_FILE})
 endforeach(TEMPLATE_FILE)
+
+if(DEFINED EXT_GIT_COMMIT_TAG OR DEFINED EXT_GIT_COMMIT_HASH OR DEFINED EXT_GIT_COMMIT_TIME)
+  list(APPEND TEST_FILES_SHARED build_info.sql)
+endif()
 
 if (TEST_FILES_SHARED)
   list(SORT TEST_FILES_SHARED)

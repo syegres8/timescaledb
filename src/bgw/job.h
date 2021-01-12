@@ -23,6 +23,7 @@ typedef bool (*scheduler_test_hook_type)(BgwJob *job);
 
 extern BackgroundWorkerHandle *ts_bgw_job_start(BgwJob *job, Oid user_oid);
 
+extern List *ts_bgw_job_get_all(size_t alloc_size, MemoryContext mctx);
 extern List *ts_bgw_job_get_scheduled(size_t alloc_size, MemoryContext mctx);
 
 extern TSDLLEXPORT List *ts_bgw_job_find_by_proc(const char *proc_name, const char *proc_schema);
@@ -45,8 +46,6 @@ extern TSDLLEXPORT int32 ts_bgw_job_insert_relation(Name application_name, Name 
 													Interval *retry_period, Name proc_schema,
 													Name proc_name, Name owner, bool scheduled,
 													int32 hypertable_id, Jsonb *config);
-extern TSDLLEXPORT void ts_bgw_job_update_by_id(int32 job_id, BgwJob *updated_job);
-
 extern TSDLLEXPORT void ts_bgw_job_permission_check(BgwJob *job);
 
 extern TSDLLEXPORT void ts_bgw_job_validate_job_owner(Oid owner);

@@ -35,6 +35,8 @@ select add_reorder_policy('test_table');
 
 select add_reorder_policy('test_table', 'second_index');
 select add_reorder_policy('test_table', 'third_index');
+select add_reorder_policy(NULL, 'third_index');
+select add_reorder_policy(2, 'third_index');
 \set ON_ERROR_STOP 1
 
 select * from _timescaledb_config.bgw_job where id=:job_id;
@@ -299,10 +301,24 @@ select * from alter_job(:job_id, schedule_interval=>'40 min', next_start=>'2004-
 select * from alter_job(:job_id, next_start=>'infinity');
 --test that you can use now() to unpause
 select next_start = now() from alter_job(:job_id, next_start=>now());
+--test pausing/resuming via scheduled parameter
+select job_id from alter_job(:job_id, scheduled=>false);
+select job_status, next_start from timescaledb_information.job_stats where job_id = :job_id;
+select job_id from alter_job(:job_id, scheduled=>true);
+select job_status from timescaledb_information.job_stats where job_id = :job_id;
 
 \set ON_ERROR_STOP 0
 -- negative infinity disallowed (used as special value)
 select * from alter_job(:job_id, next_start=>'-infinity');
+-- index should exist
+select * from alter_job(:job_id,
+       config => '{"index_name": "non-existent", "hypertable_id": 7}');
+-- index should be an index on the hypertable
+select * from alter_job(:job_id,
+       config => '{"index_name": "non_ht_index", "hypertable_id": 7}');
+-- hypertable should exist
+select * from alter_job(:job_id,
+       config => '{"index_name": "test_table_time_idx", "hypertable_id": 47}');
 \set ON_ERROR_STOP 1
 
 -- Check if_exists boolean works correctly

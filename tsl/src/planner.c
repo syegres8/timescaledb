@@ -49,24 +49,37 @@ tsl_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage, RelOptIn
 							RelOptInfo *output_rel, TsRelType input_reltype, Hypertable *ht,
 							void *extra)
 {
+	bool dist_ht = false;
 	switch (input_reltype)
 	{
 		case TS_REL_HYPERTABLE:
 		case TS_REL_HYPERTABLE_CHILD:
-			if (hypertable_is_distributed(ht))
+			dist_ht = hypertable_is_distributed(ht);
+			if (dist_ht)
 				data_node_scan_create_upper_paths(root, stage, input_rel, output_rel, extra);
 			break;
 		default:
 			break;
 	}
 
-	if (UPPERREL_GROUP_AGG == stage)
-		plan_add_gapfill(root, output_rel);
-	else if (UPPERREL_WINDOW == stage && IsA(linitial(input_rel->pathlist), CustomPath))
-		gapfill_adjust_window_targetlist(root, input_rel, output_rel);
-	else if (ts_guc_enable_async_append && UPPERREL_FINAL == stage &&
-			 root->parse->resultRelation == 0 && is_dist_hypertable_involved(root))
-		async_append_add_paths(root, output_rel);
+	switch (stage)
+	{
+		case UPPERREL_GROUP_AGG:
+			if (input_reltype != TS_REL_HYPERTABLE_CHILD)
+				plan_add_gapfill(root, output_rel);
+			break;
+		case UPPERREL_WINDOW:
+			if (IsA(linitial(input_rel->pathlist), CustomPath))
+				gapfill_adjust_window_targetlist(root, input_rel, output_rel);
+			break;
+		case UPPERREL_FINAL:
+			if (ts_guc_enable_async_append && root->parse->resultRelation == 0 &&
+				is_dist_hypertable_involved(root))
+				async_append_add_paths(root, output_rel);
+			break;
+		default:
+			break;
+	}
 }
 
 void
@@ -74,7 +87,7 @@ tsl_set_rel_pathlist_query(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeT
 						   Hypertable *ht)
 {
 	if (ts_guc_enable_transparent_decompression && ht != NULL &&
-		rel->reloptkind == RELOPT_OTHER_MEMBER_REL && TS_HYPERTABLE_HAS_COMPRESSION(ht) &&
+		rel->reloptkind == RELOPT_OTHER_MEMBER_REL && TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) &&
 		rel->fdw_private != NULL && ((TimescaleDBPrivate *) rel->fdw_private)->compressed)
 	{
 		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, true);
@@ -87,7 +100,7 @@ void
 tsl_set_rel_pathlist_dml(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 						 Hypertable *ht)
 {
-	if (ht != NULL && TS_HYPERTABLE_HAS_COMPRESSION(ht))
+	if (ht != NULL && TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
 	{
 		ListCell *lc;
 		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, true);

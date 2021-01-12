@@ -21,7 +21,6 @@ set(TEST_FILES
   drop_schema.sql
   dump_meta.sql
   extension.sql
-  gapfill.sql
   generated_as_identity.sql
   grant_hypertable.sql
   hash.sql
@@ -51,32 +50,27 @@ set(TEST_FILES
   vacuum.sql
   version.sql
   views.sql
+  license.sql
 )
-
-# edition tests need community edition
-if(NOT APACHE_ONLY)
-  list(APPEND TEST_FILES
-    chunk_utils_compression.sql
-    edition.sql
-    telemetry_community.sql
-  )
-endif()
 
 # tests that fail or are unreliable when run in parallel
 # bgw tests need to run first otherwise they are flaky
 set(SOLO_TESTS
-  bgw_db_scheduler
-  bgw_launcher
+  alter
   alternate_users
+  bgw_launcher
+  chunk_utils.sql
+  index
+  loader
   net
   pg_dump_unprivileged
+  tablespace
   telemetry
 )
 
 if (CMAKE_BUILD_TYPE MATCHES Debug)
   list(APPEND TEST_FILES
     bgw_launcher.sql
-    bgw_db_scheduler.sql
     c_unit_tests.sql
     guc_options.sql
     loader.sql
@@ -88,10 +82,6 @@ if (CMAKE_BUILD_TYPE MATCHES Debug)
     timestamp_limits.sql
     with_clause_parser.sql
   )
-  if (USE_OPENSSL)
-    list(APPEND TEST_FILES
-      privacy.sql)
-  endif (USE_OPENSSL)
 endif (CMAKE_BUILD_TYPE MATCHES Debug)
 
 if(${PG_VERSION_MAJOR} EQUAL "11")
@@ -124,7 +114,6 @@ set(TEST_TEMPLATES
   plan_expand_hypertable.sql.in
   #hashagg is different in 9.6 and 10 because of hashagg parallelism
   plan_hashagg.sql.in
-  plan_hypertable_cache.sql.in
   query.sql.in
   # Query tests differ in how PostgreSQL deals with projections on partitioned tables.
   sort_optimization.sql.in

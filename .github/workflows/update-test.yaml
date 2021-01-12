@@ -13,11 +13,11 @@ jobs:
     runs-on: 'ubuntu-18.04'
     strategy:
       matrix:
-        pg: [11.9,12.4]
+        pg: ["11.10","12.5"]
         include:
-          - pg: 11.9
+          - pg: 11.10
             pg_major: 11
-          - pg: 12.4
+          - pg: 12.5
             pg_major: 12
       fail-fast: false
     env:
@@ -34,14 +34,14 @@ jobs:
     - name: Update diff
       if: failure()
       run: |
-        find . -name "update_test.diff.*" -maxdepth 1 | xargs -IFILE sh -c "echo '\nFILE\n';cat FILE"
+        find . -name "update_test.*.diff.*" -maxdepth 1 | xargs -IFILE sh -c "echo '\nFILE\n';cat FILE"
 
     - name: Upload Artifacts
       if: failure()
       uses: actions/upload-artifact@v2
       with:
         name: Extension update diff ${{ matrix.pg }}
-        path: update_test.diff.*
+        path: update_test.*.diff.*
 
     - name: Slack Notification
       if: failure() && github.event_name != 'pull_request'

@@ -6,22 +6,26 @@
 
 #include <postgres.h>
 #include <miscadmin.h>
+#include <parser/parse_coerce.h>
+#include <utils/acl.h>
 
 #include <jsonb_utils.h>
-#include <miscadmin.h>
 #include <utils/builtins.h>
 #include "bgw_policy/continuous_aggregate_api.h"
 #include "bgw_policy/job.h"
 #include "bgw/job.h"
 #include "continuous_agg.h"
+#include "continuous_aggs/materialize.h"
 #include "dimension.h"
 #include "hypertable_cache.h"
+#include "time_utils.h"
 #include "policy_utils.h"
+#include "time_utils.h"
 
 #define POLICY_REFRESH_CAGG_PROC_NAME "policy_refresh_continuous_aggregate"
 #define CONFIG_KEY_MAT_HYPERTABLE_ID "mat_hypertable_id"
-#define CONFIG_KEY_START_INTERVAL "start_interval"
-#define CONFIG_KEY_END_INTERVAL "end_interval"
+#define CONFIG_KEY_START_OFFSET "start_offset"
+#define CONFIG_KEY_END_OFFSET "end_offset"
 
 /* Default max runtime for a continuous aggregate jobs is unlimited for now */
 #define DEFAULT_MAX_RUNTIME                                                                        \
@@ -58,13 +62,12 @@ get_interval_from_config(const Dimension *dim, const Jsonb *config, const char *
 		if (!found)
 		{
 			*isnull = true;
-			return (Datum) 0;
+			return 0;
 		}
 		Oid now_func = ts_get_integer_now_func(dim);
 
 		Assert(now_func);
-
-		return subtract_integer_from_now(interval_val, partitioning_type, now_func);
+		return ts_subtract_integer_from_now_saturating(now_func, interval_val, partitioning_type);
 	}
 	else
 	{
@@ -81,15 +84,24 @@ get_interval_from_config(const Dimension *dim, const Jsonb *config, const char *
 }
 
 int64
-policy_refresh_cagg_get_refresh_start(const Dimension *dim, const Jsonb *config, bool *start_isnull)
+policy_refresh_cagg_get_refresh_start(const Dimension *dim, const Jsonb *config)
 {
-	return get_interval_from_config(dim, config, CONFIG_KEY_START_INTERVAL, start_isnull);
+	bool start_isnull;
+	int64 res = get_interval_from_config(dim, config, CONFIG_KEY_START_OFFSET, &start_isnull);
+	/* interpret NULL as min value for that type */
+	if (start_isnull)
+		return ts_time_get_min(ts_dimension_get_partition_type(dim));
+	return res;
 }
 
 int64
-policy_refresh_cagg_get_refresh_end(const Dimension *dim, const Jsonb *config, bool *end_isnull)
+policy_refresh_cagg_get_refresh_end(const Dimension *dim, const Jsonb *config)
 {
-	return get_interval_from_config(dim, config, CONFIG_KEY_END_INTERVAL, end_isnull);
+	bool end_isnull;
+	int64 res = get_interval_from_config(dim, config, CONFIG_KEY_END_OFFSET, &end_isnull);
+	if (end_isnull)
+		return ts_time_get_end_or_max(ts_dimension_get_partition_type(dim));
+	return res;
 }
 
 Datum
@@ -98,7 +110,7 @@ policy_refresh_cagg_proc(PG_FUNCTION_ARGS)
 	if (PG_NARGS() != 2 || PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		PG_RETURN_VOID();
 
-	PreventCommandIfReadOnly("policy_refresh_continuous_aggregate()");
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 	policy_refresh_cagg_execute(PG_GETARG_INT32(0), PG_GETARG_JSONB_P(1));
 
 	PG_RETURN_VOID();
@@ -143,25 +155,75 @@ json_add_dim_interval_value(JsonbParseState *parse_state, const char *json_label
 	}
 }
 
-static void
-check_valid_interval(Oid dim_type, Oid interval_type, const char *str_msg)
+static Datum
+convert_interval_arg(Oid dim_type, Datum interval, Oid *interval_type, const char *str_msg)
 {
-	if (IS_INTEGER_TYPE(dim_type))
+	Oid convert_to = dim_type;
+
+	if (*interval_type != convert_to)
 	{
-		if (interval_type != dim_type)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid parameter value for %s", str_msg),
-					 errhint("Use time interval of type %s with the continuous aggregate.",
-							 format_type_be(dim_type))));
+		if (IS_TIMESTAMP_TYPE(dim_type))
+			convert_to = INTERVALOID;
+
+		if (!can_coerce_type(1, interval_type, &convert_to, COERCION_IMPLICIT))
+		{
+			if (IS_INTEGER_TYPE(dim_type))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid parameter value for %s", str_msg),
+						 errhint("Use time interval of type %s with the continuous aggregate.",
+								 format_type_be(dim_type))));
+			else if (IS_TIMESTAMP_TYPE(dim_type))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid parameter value for %s", str_msg),
+						 errhint("Use time interval with a continuous aggregate using "
+								 "timestamp-based time "
+								 "bucket.")));
+		}
 	}
-	else if (IS_TIMESTAMP_TYPE(dim_type) && (interval_type != INTERVALOID))
+
+	return ts_time_datum_convert_arg(interval, interval_type, convert_to);
+}
+
+static void
+check_valid_interval_values(Oid interval_type, Datum start_offset, Datum end_offset)
+{
+	bool valid = true;
+	if (IS_INTEGER_TYPE(interval_type))
+	{
+		switch (interval_type)
+		{
+			case INT2OID:
+			{
+				if (DatumGetInt16(start_offset) <= DatumGetInt16(end_offset))
+					valid = false;
+				break;
+			}
+			case INT4OID:
+			{
+				if (DatumGetInt32(start_offset) <= DatumGetInt32(end_offset))
+					valid = false;
+				break;
+			}
+			case INT8OID:
+			{
+				if (DatumGetInt64(start_offset) <= DatumGetInt64(end_offset))
+					valid = false;
+				break;
+			}
+		}
+	}
+	else
+	{
+		Assert(interval_type == INTERVALOID);
+		valid = DatumGetBool(DirectFunctionCall2(interval_gt, start_offset, end_offset));
+	}
+	if (!valid)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid parameter value for %s", str_msg),
-				 errhint("Use time interval with a continuous aggregate using timestamp-based time "
-						 "bucket.")));
+				 errmsg("start interval should be greater than end interval")));
 	}
 }
 
@@ -176,45 +238,63 @@ policy_refresh_cagg_add(PG_FUNCTION_ARGS)
 	Dimension *dim;
 	ContinuousAgg *cagg;
 	int32 job_id, mat_htid;
-	Datum start_interval, end_interval;
+	Datum start_offset, end_offset;
 	Interval refresh_interval;
-	Oid dim_type, start_interval_type, end_interval_type;
+	Oid dim_type, start_offset_type, end_offset_type;
 	Oid cagg_oid, owner_id;
 	List *jobs;
+	JsonbParseState *parse_state = NULL;
 	bool if_not_exists, start_isnull, end_isnull;
-	if (PG_ARGISNULL(3))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot use NULL schedule interval")));
-	}
-	cagg_oid = PG_GETARG_OID(0);
-	start_interval = PG_GETARG_DATUM(1);
-	end_interval = PG_GETARG_DATUM(2);
-	start_isnull = PG_ARGISNULL(1);
-	end_isnull = PG_ARGISNULL(2);
-	start_interval_type = get_fn_expr_argtype(fcinfo->flinfo, 1);
-	end_interval_type = get_fn_expr_argtype(fcinfo->flinfo, 2);
-	refresh_interval = *PG_GETARG_INTERVAL_P(3);
-	if_not_exists = PG_GETARG_BOOL(4);
-	cagg = ts_continuous_agg_find_by_relid(cagg_oid);
-	if (!cagg)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" is not a continuous aggregate", get_rel_name(cagg_oid))));
-	}
 
-	mat_htid = cagg->data.mat_hypertable_id;
 	/* Verify that the owner can create a background worker */
+	cagg_oid = PG_GETARG_OID(0);
 	owner_id = ts_cagg_permissions_check(cagg_oid, GetUserId());
 	ts_bgw_job_validate_job_owner(owner_id);
 
+	cagg = ts_continuous_agg_find_by_relid(cagg_oid);
+	if (!cagg)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" is not a continuous aggregate", get_rel_name(cagg_oid))));
+
 	hcache = ts_hypertable_cache_pin();
+	mat_htid = cagg->data.mat_hypertable_id;
 	mat_ht = ts_hypertable_cache_get_entry_by_id(hcache, mat_htid);
 	dim = hyperspace_get_open_dimension(mat_ht->space, 0);
 	dim_type = ts_dimension_get_partition_type(dim);
 	ts_cache_release(hcache);
+
+	/* Try to convert the argument to the time type used by the
+	 * continuous aggregate */
+	start_offset = PG_GETARG_DATUM(1);
+	end_offset = PG_GETARG_DATUM(2);
+	start_isnull = PG_ARGISNULL(1);
+	end_isnull = PG_ARGISNULL(2);
+	start_offset_type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	end_offset_type = get_fn_expr_argtype(fcinfo->flinfo, 2);
+
+	if (!start_isnull)
+		start_offset = convert_interval_arg(dim_type,
+											start_offset,
+											&start_offset_type,
+											CONFIG_KEY_START_OFFSET);
+
+	if (!end_isnull)
+		end_offset =
+			convert_interval_arg(dim_type, end_offset, &end_offset_type, CONFIG_KEY_END_OFFSET);
+
+	if (!start_isnull && !end_isnull)
+	{
+		Assert(start_offset_type == end_offset_type);
+		check_valid_interval_values(start_offset_type, start_offset, end_offset);
+	}
+
+	if (PG_ARGISNULL(3))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot use NULL schedule interval")));
+	refresh_interval = *PG_GETARG_INTERVAL_P(3);
+	if_not_exists = PG_GETARG_BOOL(4);
 
 	/* Make sure there is only 1 refresh policy on the cagg */
 	jobs = ts_bgw_job_find_by_proc_and_hypertable_id(POLICY_REFRESH_CAGG_PROC_NAME,
@@ -227,33 +307,35 @@ policy_refresh_cagg_add(PG_FUNCTION_ARGS)
 		if (!if_not_exists)
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("refresh policy already exists for continuous aggregate \"%s\"",
+					 errmsg("continuous aggregate policy already exists for \"%s\"",
 							get_rel_name(cagg_oid))));
 		BgwJob *existing = linitial(jobs);
 
 		if (policy_config_check_hypertable_lag_equality(existing->fd.config,
-														CONFIG_KEY_START_INTERVAL,
+														CONFIG_KEY_START_OFFSET,
 														dim_type,
-														start_interval_type,
-														start_interval) &&
+														start_offset_type,
+														start_offset) &&
 			policy_config_check_hypertable_lag_equality(existing->fd.config,
-														CONFIG_KEY_END_INTERVAL,
+														CONFIG_KEY_END_OFFSET,
 														dim_type,
-														end_interval_type,
-														end_interval))
+														end_offset_type,
+														end_offset))
 		{
 			/* If all arguments are the same, do nothing */
 			ereport(NOTICE,
-					(errmsg("refresh policy already exists on continuous aggregate \"%s\", "
+					(errmsg("continuous aggregate policy already exists for \"%s\", "
 							"skipping",
 							get_rel_name(cagg_oid))));
 			PG_RETURN_INT32(-1);
 		}
 		else
 		{
-			elog(WARNING,
-				 "could not add refresh policy due to existing policy on continuous aggregate with "
-				 "different arguments");
+			ereport(WARNING,
+					(errmsg("continuous aggregate policy already exists for \"%s\"",
+							get_rel_name(cagg_oid)),
+					 errdetail("A policy already exists with different arguments."),
+					 errhint("Remove the existing policy before adding a new one.")));
 			PG_RETURN_INT32(-1);
 		}
 	}
@@ -265,28 +347,22 @@ policy_refresh_cagg_add(PG_FUNCTION_ARGS)
 	namestrcpy(&proc_schema, INTERNAL_SCHEMA_NAME);
 	namestrcpy(&owner, GetUserNameFromId(owner_id, false));
 
-	if (!start_isnull)
-		check_valid_interval(dim_type, start_interval_type, "start_interval");
-	if (!end_isnull)
-		check_valid_interval(dim_type, end_interval_type, "end_interval");
-
-	JsonbParseState *parse_state = NULL;
 	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
 	ts_jsonb_add_int32(parse_state, CONFIG_KEY_MAT_HYPERTABLE_ID, mat_htid);
 	if (!start_isnull)
 		json_add_dim_interval_value(parse_state,
-									CONFIG_KEY_START_INTERVAL,
-									start_interval_type,
-									start_interval);
+									CONFIG_KEY_START_OFFSET,
+									start_offset_type,
+									start_offset);
 	else
-		ts_jsonb_add_null(parse_state, CONFIG_KEY_START_INTERVAL);
+		ts_jsonb_add_null(parse_state, CONFIG_KEY_START_OFFSET);
 	if (!end_isnull)
 		json_add_dim_interval_value(parse_state,
-									CONFIG_KEY_END_INTERVAL,
-									end_interval_type,
-									end_interval);
+									CONFIG_KEY_END_OFFSET,
+									end_offset_type,
+									end_offset);
 	else
-		ts_jsonb_add_null(parse_state, CONFIG_KEY_END_INTERVAL);
+		ts_jsonb_add_null(parse_state, CONFIG_KEY_END_OFFSET);
 	JsonbValue *result = pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
 	Jsonb *config = JsonbValueToJsonb(result);
 
@@ -314,12 +390,11 @@ policy_refresh_cagg_remove(PG_FUNCTION_ARGS)
 	int32 mat_htid;
 
 	ContinuousAgg *cagg = ts_continuous_agg_find_by_relid(cagg_oid);
+
 	if (!cagg)
-	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("\"%s\" is not a continuous aggregate", get_rel_name(cagg_oid))));
-	}
 
 	ts_cagg_permissions_check(cagg_oid, GetUserId());
 	mat_htid = cagg->data.mat_hypertable_id;
@@ -331,14 +406,12 @@ policy_refresh_cagg_remove(PG_FUNCTION_ARGS)
 		if (!if_exists)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 (errmsg("refresh policy does not exist on continuous aggregate "
-							 "\"%s\"",
+					 (errmsg("continuous aggregate policy not found for \"%s\"",
 							 get_rel_name(cagg_oid)))));
 		else
 		{
 			ereport(NOTICE,
-					(errmsg("refresh policy does not exist on continuous aggregate \"%s\", "
-							"skipping",
+					(errmsg("continuous aggregate policy not found for \"%s\", skipping",
 							get_rel_name(cagg_oid))));
 			PG_RETURN_VOID();
 		}

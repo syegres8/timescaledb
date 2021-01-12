@@ -33,14 +33,14 @@ setup
     AS
       SELECT time_bucket(10, time) AS bucket, avg(temp) AS avg_temp
       FROM conditions
-      GROUP BY 1;
+      GROUP BY 1 WITH NO DATA;
     CREATE MATERIALIZED VIEW cond_20
     WITH (timescaledb.continuous,
       timescaledb.materialized_only=true)
     AS
       SELECT time_bucket(20, time) AS bucket, avg(temp) AS avg_temp
       FROM conditions
-      GROUP BY 1;
+      GROUP BY 1 WITH NO DATA;
 
     CREATE OR REPLACE FUNCTION cagg_bucket_count(cagg regclass)
     RETURNS int AS
@@ -128,7 +128,7 @@ setup
 }
 step "R1_refresh"
 {
-    CALL refresh_continuous_aggregate('cond_10', 35, 62);
+    CALL refresh_continuous_aggregate('cond_10', 25, 70);
 }
 
 
@@ -154,7 +154,7 @@ setup
 }
 step "R3_refresh"
 {
-    CALL refresh_continuous_aggregate('cond_10', 71, 97);
+    CALL refresh_continuous_aggregate('cond_10', 70, 107);
 }
 
 # Overlapping refresh on another continuous aggregate (cond_20)
@@ -181,11 +181,6 @@ setup
     BEGIN;
     SET SESSION lock_timeout = '500ms';
     SET SESSION deadlock_timeout = '500ms';
-}
-step "L1_lock_threshold_table"
-{
-    LOCK _timescaledb_catalog.continuous_aggs_invalidation_threshold
-    IN ACCESS EXCLUSIVE MODE;
 }
 step "L1_unlock_threshold_table"
 {

@@ -23,7 +23,6 @@
 #include <optimizer/optimizer.h>
 #endif
 
-#include "license.h"
 #include "nodes/gapfill/gapfill.h"
 #include "nodes/gapfill/planner.h"
 #include "nodes/gapfill/exec.h"
@@ -82,6 +81,19 @@ gapfill_function_walker(Node *node, gapfill_walker_context *context)
 	}
 
 	return expression_tree_walker((Node *) node, gapfill_function_walker, context);
+}
+
+/*
+ * Check if the given expression contains call to time_bucket_gapfill
+ */
+bool
+gapfill_in_expression(Expr *node)
+{
+	gapfill_walker_context context = { .call.node = NULL, .count = 0 };
+
+	gapfill_function_walker((Node *) node, &context);
+
+	return context.count > 0;
 }
 
 /*
@@ -283,8 +295,10 @@ gapfill_build_pathtarget(PathTarget *pt_upper, PathTarget *pt_path, PathTarget *
 				/*
 				 * check arguments past first argument dont have Vars
 				 */
-				for (lc_arg = lnext(list_head(context.call.window->args)); lc_arg != NULL;
-					 lc_arg = lnext(lc_arg))
+				for (lc_arg = lnext_compat(context.call.window->args,
+										   list_head(context.call.window->args));
+					 lc_arg != NULL;
+					 lc_arg = lnext_compat(context.call.window->args, lc_arg))
 				{
 					if (contain_var_clause(lfirst(lc_arg)))
 						ereport(ERROR,
@@ -396,7 +410,9 @@ gapfill_path_create(PlannerInfo *root, Path *subpath, FuncExpr *func)
 }
 
 /*
- * Prepend GapFill node to every group_rel path
+ * Prepend GapFill node to every group_rel path.
+ * The implementation assumes that TimescaleDB planning hook is called only once
+ * per grouping.
  */
 void
 plan_add_gapfill(PlannerInfo *root, RelOptInfo *group_rel)
@@ -409,7 +425,10 @@ plan_add_gapfill(PlannerInfo *root, RelOptInfo *group_rel)
 		return;
 
 	/*
-	 * look for time_bucket_gapfill function call
+	 * Look for time_bucket_gapfill function call in the target list, which
+	 * will succeed on every call to plan_add_gapfill, thus it will lead to
+	 * incorrect query plan if plan_add_gapfill is called more than once per
+	 * grouping.
 	 */
 	gapfill_function_walker((Node *) parse->targetList, &context);
 
@@ -536,9 +555,10 @@ gapfill_adjust_window_targetlist(PlannerInfo *root, RelOptInfo *input_rel, RelOp
 								/*
 								 * check arguments past first argument dont have Vars
 								 */
-								for (lc_arg = lnext(list_head(context.call.window->args));
+								for (lc_arg = lnext_compat(context.call.window->args,
+														   list_head(context.call.window->args));
 									 lc_arg != NULL;
-									 lc_arg = lnext(lc_arg))
+									 lc_arg = lnext_compat(context.call.window->args, lc_arg))
 								{
 									if (contain_var_clause(lfirst(lc_arg)))
 										ereport(ERROR,

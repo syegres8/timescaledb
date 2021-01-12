@@ -13,7 +13,6 @@
 #include <fmgr.h>
 #include <utils/lsyscache.h>
 #include <catalog/pg_type.h>
-#include <access/tuptoaster.h>
 
 #include "compat.h"
 #if PG12_GE
@@ -21,11 +20,11 @@
 #else
 #include <nodes/relation.h>
 #endif
+
+#include <annotations.h>
 #include "async.h"
 #include "connection.h"
 #include "utils.h"
-
-#define MAX_ASYNC_TIMEOUT_MS 60000
 
 /**
  * State machine for AsyncRequest:
@@ -175,11 +174,11 @@ async_request_send_internal(AsyncRequest *req, int elevel)
 		 * the prepared statements we use in this module are simple enough that
 		 * the data node will make the right choices.
 		 */
-		if (!PQsendPrepare(remote_connection_get_pg_conn(req->conn),
-						   req->stmt_name,
-						   req->sql,
-						   req->prep_stmt_params,
-						   NULL))
+		if (0 == PQsendPrepare(remote_connection_get_pg_conn(req->conn),
+							   req->stmt_name,
+							   req->sql,
+							   req->prep_stmt_params,
+							   NULL))
 		{
 			/*
 			 * null is fine to pass down as the res, the connection error message
@@ -510,6 +509,67 @@ async_request_wait_ok_result(AsyncRequest *req)
 	return res;
 }
 
+/*
+ * Get the result of an async request during cleanup.
+ *
+ * Cleanup is typically necessary for a query that is being interrupted by
+ * transaction abort, or a query that was initiated as part of transaction
+ * abort to get the remote side back to the appropriate state.
+ *
+ * endtime is the time at which we should give up and assume the remote
+ * side is dead.
+ *
+ * An AsyncReponse is always returned, indicating last PGresult received,
+ * a timeout, or error.
+ */
+AsyncResponse *
+async_request_cleanup_result(AsyncRequest *req, TimestampTz endtime)
+{
+	TSConnection *conn = async_request_get_connection(req);
+	PGresult *last_res = NULL;
+	AsyncResponse *rsp = NULL;
+
+	switch (req->state)
+	{
+		case DEFERRED:
+			if (remote_connection_is_processing(req->conn))
+				return async_response_error_create("request already in progress");
+
+			req = async_request_send_internal(req, WARNING);
+
+			if (req == NULL)
+				return async_response_error_create("failed to send deferred request");
+
+			Assert(req->state == EXECUTING);
+			break;
+		case EXECUTING:
+			break;
+		case COMPLETED:
+			return async_response_error_create("request already completed");
+	}
+
+	switch (remote_connection_drain(conn, endtime, &last_res))
+	{
+		case CONN_TIMEOUT:
+			rsp = async_response_timeout_create();
+			break;
+		case CONN_DISCONNECT:
+			rsp = &async_response_communication_error_create(req)->base;
+			break;
+		case CONN_NO_RESPONSE:
+			rsp = async_response_error_create("no response during cleanup");
+			break;
+		case CONN_OK:
+			Assert(last_res != NULL);
+			rsp = &async_response_result_create(req, last_res)->base;
+			break;
+	}
+
+	Assert(rsp != NULL);
+
+	return rsp;
+}
+
 void
 async_request_wait_ok_command(AsyncRequest *req)
 {
@@ -561,38 +621,44 @@ get_single_response_nonblocking(AsyncRequestSet *set)
 		AsyncRequest *req = lfirst(lc);
 		PGconn *pg_conn = remote_connection_get_pg_conn(req->conn);
 
-		if (remote_connection_is_processing(req->conn) && req->state == DEFERRED)
-			return async_response_error_create("request already in process");
-
-		if (req->state == DEFERRED)
+		switch (req->state)
 		{
-			req = async_request_send_internal(req, WARNING);
+			case DEFERRED:
+				if (remote_connection_is_processing(req->conn))
+					return async_response_error_create("request already in progress");
 
-			if (req == NULL)
-				return async_response_error_create("failed to send deferred request");
-		}
+				req = async_request_send_internal(req, WARNING);
 
-		if (req->state != EXECUTING)
-			return async_response_error_create("no request currently executing");
+				if (req == NULL)
+					return async_response_error_create("failed to send deferred request");
 
-		if (!PQisBusy(pg_conn))
-		{
-			PGresult *res = PQgetResult(pg_conn);
+				Assert(req->state == EXECUTING);
+				TS_FALLTHROUGH;
+			case EXECUTING:
+				if (0 == PQisBusy(pg_conn))
+				{
+					PGresult *res = PQgetResult(pg_conn);
 
-			if (NULL == res)
-			{
-				/*
-				 * NULL return means query is complete
-				 */
-				set->requests = list_delete_ptr(set->requests, req);
-				remote_connection_set_processing(req->conn, false);
-				async_request_set_state(req, COMPLETED);
-				/* set changed so rerun function */
-				return get_single_response_nonblocking(set);
-			}
-			return &async_response_result_create(req, res)->base;
+					if (NULL == res)
+					{
+						/*
+						 * NULL return means query is complete
+						 */
+						set->requests = list_delete_ptr(set->requests, req);
+						remote_connection_set_processing(req->conn, false);
+						async_request_set_state(req, COMPLETED);
+
+						/* set changed so rerun function */
+						return get_single_response_nonblocking(set);
+					}
+					return &async_response_result_create(req, res)->base;
+				}
+				break;
+			case COMPLETED:
+				return async_response_error_create("request already completed");
 		}
 	}
+
 	return NULL;
 }
 
@@ -631,9 +697,7 @@ wait_to_consume_data(AsyncRequestSet *set, TimestampTz end_time)
 			return async_response_timeout_create();
 
 		TimestampDifference(now, end_time, &secs, &microsecs);
-
-		/* To protect against clock skew, limit sleep to one minute. */
-		timeout_ms = Min(MAX_ASYNC_TIMEOUT_MS, secs * 1000 + (microsecs / 1000));
+		timeout_ms = secs * 1000 + (microsecs / 1000);
 	}
 
 	we_set = CreateWaitEventSet(CurrentMemoryContext, list_length(set->requests) + 1);

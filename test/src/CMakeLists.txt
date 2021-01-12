@@ -3,6 +3,7 @@ set(SOURCES
   symbol_conflict.c
   test_time_to_internal.c
   test_with_clause_parser.c
+  test_time_utils.c
   test_utils.c
 )
 
@@ -18,10 +19,6 @@ set_target_properties(${TESTS_LIB_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Set the MODULE_NAME for the symbol conflict test (see symbol_conflict.c)
 target_compile_definitions(${TESTS_LIB_NAME} PUBLIC MODULE_NAME=timescaledb)
 target_include_directories(${TESTS_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
-if(APACHE_ONLY)
-  add_definitions(-DAPACHE_ONLY)
-endif()
 
 add_subdirectory(bgw)
 add_subdirectory(net)

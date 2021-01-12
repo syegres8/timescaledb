@@ -29,7 +29,7 @@ AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
 \set WAIT_FOR_OTHER_TO_ADVANCE 2
 
 -- Remove any default jobs, e.g., telemetry
-DELETE FROM _timescaledb_config.bgw_job WHERE TRUE;
+DELETE FROM _timescaledb_config.bgw_job;
 TRUNCATE _timescaledb_internal.bgw_job_stat;
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
@@ -62,7 +62,7 @@ INSERT INTO public.bgw_dsm_handle_store VALUES (0);
 SELECT ts_bgw_params_create();
 
 SELECT * FROM _timescaledb_config.bgw_job;
-SELECT * FROM timescaledb_information.policy_stats;
+SELECT * FROM timescaledb_information.job_stats;
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
 
@@ -87,7 +87,7 @@ select add_reorder_policy('test_reorder_table', 'test_reorder_table_time_idx') a
 SELECT json_object_field(get_telemetry_report(always_display_report := true)::json,'num_reorder_policies');
 
 -- job was created
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 -- no stats
 SELECT job_id, next_start, last_finish as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -104,7 +104,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 -- job ran once, successfully
 SELECT job_id, next_start, last_finish as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -121,7 +121,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 -- two runs
 SELECT job_id, next_start, last_finish as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -140,7 +140,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(50);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 SELECT *
     FROM _timescaledb_internal.bgw_job_stat
@@ -157,7 +157,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(100);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 SELECT *
     FROM _timescaledb_internal.bgw_job_stat
@@ -169,12 +169,12 @@ SELECT indexrelid::regclass, indisclustered
     WHERE indisclustered = true ORDER BY 1;
 
 --check that views work correctly
-SELECT * FROM timescaledb_information.policy_stats;
+SELECT * FROM timescaledb_information.job_stats;
 
 -- test deleting the policy
 SELECT remove_reorder_policy('test_reorder_table');
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 SELECT job_id, next_start, last_finish as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
     FROM _timescaledb_internal.bgw_job_stat
@@ -184,7 +184,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(125);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:reorder_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:reorder_job_id;
 
 -- still only 3 chunks clustered
 SELECT indexrelid::regclass, indisclustered
@@ -219,13 +219,13 @@ INSERT INTO test_drop_chunks_table VALUES (now() - INTERVAL '8 months', 1);
 SELECT show_chunks('test_drop_chunks_table');
 SELECT COUNT(*) FROM _timescaledb_catalog.chunk as c, _timescaledb_catalog.hypertable as ht where c.hypertable_id = ht.id and ht.table_name='test_drop_chunks_table';
 
-SELECT json_object_field(get_telemetry_report(always_display_report := true)::json,'num_drop_chunks_policies');
+SELECT json_object_field(get_telemetry_report(always_display_report := true)::json,'num_retention_policies');
 SELECT add_retention_policy('test_drop_chunks_table', INTERVAL '4 months') as drop_chunks_job_id \gset
-SELECT json_object_field(get_telemetry_report(always_display_report := true)::json,'num_drop_chunks_policies');
+SELECT json_object_field(get_telemetry_report(always_display_report := true)::json,'num_retention_policies');
 
 SELECT alter_job(:drop_chunks_job_id, schedule_interval => INTERVAL '1 second');
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:drop_chunks_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:drop_chunks_job_id;
 
 -- no stats
 SELECT job_id, next_start, last_finish as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -240,7 +240,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:drop_chunks_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:drop_chunks_job_id;
 
 -- job ran once, successfully
 SELECT job_id, time_bucket('1m',next_start) AS next_start, time_bucket('1m',last_finish) as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -255,7 +255,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:drop_chunks_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:drop_chunks_job_id;
 
 -- still only 1 run
 SELECT job_id, time_bucket('1m',next_start) AS next_start, time_bucket('1m',last_finish) as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -274,7 +274,7 @@ SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(10000);
 
 SELECT * FROM sorted_bgw_log;
 
-SELECT * FROM _timescaledb_config.bgw_job where id=:drop_chunks_job_id;
+SELECT * FROM timescaledb_information.jobs WHERE job_id=:drop_chunks_job_id;
 
 -- 2 runs
 SELECT job_id, time_bucket('1m',next_start) AS next_start, time_bucket('1m',last_finish) as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
@@ -284,27 +284,4 @@ SELECT job_id, time_bucket('1m',next_start) AS next_start, time_bucket('1m',last
 SELECT show_chunks('test_drop_chunks_table');
 
 --test that views work
-SELECT * FROM timescaledb_information.policy_stats;
-
--- continuous aggregate blocks drop_chunks
-INSERT INTO test_drop_chunks_table VALUES (now() - INTERVAL '12 months', 0);
-
-CREATE MATERIALIZED VIEW tdc_view
-  WITH (timescaledb.continuous)
-  AS SELECT time_bucket('1 hour', time), count(drop_order)
-     FROM test_drop_chunks_table
-     GROUP BY 1;
-SELECT add_refresh_continuous_aggregate_policy('tdc_view', NULL, '2 h'::interval, '12 h'::interval);
-SELECT show_chunks('test_drop_chunks_table');
-
-SELECT alter_job(:drop_chunks_job_id, max_retries => 0);
-SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(10000);
-
-SELECT * FROM _timescaledb_config.bgw_job where id=:drop_chunks_job_id;
-
--- should now have a failure
-SELECT job_id, time_bucket('1m',next_start) AS next_start, time_bucket('1m',last_finish) as until_next, last_run_success, total_runs, total_successes, total_failures, total_crashes
-    FROM _timescaledb_internal.bgw_job_stat
-    where job_id=:drop_chunks_job_id;
-
-SELECT show_chunks('test_drop_chunks_table');
+SELECT * FROM timescaledb_information.job_stats;

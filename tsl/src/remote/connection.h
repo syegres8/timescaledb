@@ -39,7 +39,8 @@ extern TSConnection *remote_connection_open_with_options(const char *node_name,
 														 List *connection_options,
 														 bool set_dist_id);
 extern TSConnection *remote_connection_open_with_options_nothrow(const char *node_name,
-																 List *connection_options);
+																 List *connection_options,
+																 char **errmsg);
 extern TSConnection *remote_connection_open_by_id(TSConnectionId id);
 extern TSConnection *remote_connection_open(Oid server_id, Oid user_id);
 extern TSConnection *remote_connection_open_nothrow(Oid server_id, Oid user_id, char **errmsg);
@@ -68,10 +69,19 @@ extern unsigned int remote_connection_get_cursor_number(void);
 extern void remote_connection_reset_cursor_number(void);
 extern unsigned int remote_connection_get_prep_stmt_number(void);
 extern bool remote_connection_configure(TSConnection *conn);
-extern bool remote_connection_check_extension(TSConnection *conn, const char **owner_name,
-											  Oid *owner_oid);
+extern bool remote_connection_check_extension(TSConnection *conn);
 extern void remote_validate_extension_version(TSConnection *conn, const char *data_node_version);
 
+typedef enum TSConnectionResult
+{
+	CONN_OK,
+	CONN_TIMEOUT,
+	CONN_DISCONNECT,
+	CONN_NO_RESPONSE,
+} TSConnectionResult;
+
+TSConnectionResult remote_connection_drain(TSConnection *conn, TimestampTz endtime,
+										   PGresult **result);
 extern bool remote_connection_cancel_query(TSConnection *conn);
 extern PGconn *remote_connection_get_pg_conn(const TSConnection *conn);
 extern bool remote_connection_is_processing(const TSConnection *conn);
@@ -101,7 +111,7 @@ typedef struct RemoteConnectionStats
 	unsigned int results_cleared;
 } RemoteConnectionStats;
 
-#if TS_DEBUG
+#ifdef TS_DEBUG
 extern void remote_connection_stats_reset(void);
 extern RemoteConnectionStats *remote_connection_stats_get(void);
 #endif
